@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:http/http.dart' as http;
@@ -107,28 +108,23 @@ class ConnectionHealthMonitor {
   /// `true` if the monitor created [_httpClient] itself and is therefore
   /// responsible for closing it on [dispose]. An injected client is
   /// owned by the caller and must never be closed here.
-  // ignore: unused_field
   final bool _ownsClient;
 
   /// Pre-composed request URI. Built once at construction time so the
   /// hot path does not repeat URL parsing/normalization on every check.
-  // ignore: unused_field
   final Uri _uri;
 
   /// HTTP client used for the server probe. Either injected by the
   /// caller or created in the constructor (see [_ownsClient]).
-  // ignore: unused_field
   final http.Client _httpClient;
 
   /// Generic-internet probe used as a tiebreaker when the server check
   /// fails. Probes public CDN endpoints (Cloudflare, Apple captive,
   /// Google) - see `internet_connection_checker_plus` docs.
-  // ignore: unused_field
   final InternetConnection _internetChecker;
 
   /// Source of randomness for +/- jitter on scheduled delays. Inject a
   /// seeded `Random` in tests for deterministic timing.
-  // ignore: unused_field
   final Random _random;
 
   /// Broadcast controller for state transitions. Multiple subscribers
@@ -139,30 +135,25 @@ class ConnectionHealthMonitor {
   /// `true` between [start] and [stop]. The loop checks this before
   /// emitting and before scheduling the next iteration; a pending check
   /// that completes after `stop()` must NOT emit or reschedule.
-  // ignore: unused_field, prefer_final_fields
   bool _running = false;
 
   /// `true` after [dispose]. Every public method checks this first and
   /// throws [StateError] if set, to guarantee no late events fire from
   /// a disposed instance.
-  // ignore: unused_field, prefer_final_fields
   bool _disposed = false;
 
   /// Handle for the next scheduled check. Stored so [stop] and
   /// [dispose] can cancel it cleanly.
-  // ignore: unused_field
   Timer? _pendingTimer;
 
   /// Cached most-recent state. Returned by [currentState] and used as
   /// the de-dupe baseline; starts as [ConnectionHealthState.initial].
-  // ignore: prefer_final_fields
   ConnectionHealthState _currentState = ConnectionHealthState.initial;
 
   /// Last state actually emitted on [stream]. Used to de-dupe so that
   /// repeated `healthy -> healthy` observations do not cause needless
   /// `StreamBuilder` rebuilds. Initialized to `initial` so the first
   /// real check produces exactly one emission.
-  // ignore: unused_field, prefer_final_fields
   ConnectionHealthState _lastState = ConnectionHealthState.initial;
 
   // ---------------------------------------------------------------------------
@@ -195,7 +186,11 @@ class ConnectionHealthMonitor {
   /// Idempotent: a second call while already running is a no-op.
   /// Calling after [dispose] throws [StateError].
   void start() {
-    throw UnimplementedError('ST-2 will implement');
+    _throwIfDisposed();
+    if (_running) return;
+    _running = true;
+    // Fire-and-forget: the loop self-schedules via Timer.
+    unawaited(_loop());
   }
 
   /// Pauses the polling loop without tearing down the monitor.
@@ -207,8 +202,11 @@ class ConnectionHealthMonitor {
   /// `AppLifecycleState.paused` / `inactive` / `detached` / `hidden`.
   ///
   /// For terminal cleanup at app shutdown, use [dispose] instead.
-  Future<void> stop() {
-    throw UnimplementedError('ST-2 will implement');
+  Future<void> stop() async {
+    _throwIfDisposed();
+    _running = false;
+    _pendingTimer?.cancel();
+    _pendingTimer = null;
   }
 
   /// Terminal cleanup. Cancels the pending timer, closes the broadcast
@@ -218,8 +216,21 @@ class ConnectionHealthMonitor {
   /// After [dispose] returns, any public method call - including a
   /// second [dispose] - throws [StateError]. Use [stop] instead if you
   /// want to pause and resume.
-  Future<void> dispose() {
-    throw UnimplementedError('ST-2 will implement');
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    _running = false;
+    _pendingTimer?.cancel();
+    _pendingTimer = null;
+    await _controller.close();
+    if (_ownsClient) {
+      try {
+        _httpClient.close();
+      } on Object {
+        // Swallow: the client may already be mid-request and closing it
+        // can raise; the in-flight guard in `_loop` drops the result.
+      }
+    }
   }
 
   /// Performs a one-off health check immediately and returns the
@@ -234,13 +245,116 @@ class ConnectionHealthMonitor {
   /// Callers that expect a stream emission will get silent breakage -
   /// subscribe to [stream] for emissions, await [checkNow] for the
   /// return value.
-  Future<ConnectionHealthState> checkNow() {
-    throw UnimplementedError('ST-2 will implement');
+  Future<ConnectionHealthState> checkNow() async {
+    _throwIfDisposed();
+    _pendingTimer?.cancel();
+    _pendingTimer = null;
+    final state = await _runCheck();
+    if (_disposed) return state;
+    _currentState = state;
+    if (_running) {
+      _pendingTimer = Timer(_nextDelay(state), () {
+        unawaited(_loop());
+      });
+    }
+    return state;
   }
 
   // ---------------------------------------------------------------------------
   // Internal helpers.
   // ---------------------------------------------------------------------------
+
+  /// One adaptive iteration: run the dual-tier check, emit on change,
+  /// schedule the next iteration. Bails without emitting or scheduling
+  /// if [stop] or [dispose] fired while the check was in flight.
+  Future<void> _loop() async {
+    if (!_running || _disposed) return;
+    final state = await _runCheck();
+    if (!_running || _disposed) return;
+    _emitIfChanged(state);
+    _pendingTimer = Timer(_nextDelay(state), () {
+      unawaited(_loop());
+    });
+  }
+
+  /// Server-first dual-tier check. Returns `healthy` on a 2xx response
+  /// from the server probe. Otherwise disambiguates: if the generic
+  /// internet probe also fails, the device is offline
+  /// ([ConnectionHealthState.internetDisconnected]); else the server is
+  /// the cause ([ConnectionHealthState.serverUnreachable]).
+  ///
+  /// Inverting the previous "internet probe first" order fixes the
+  /// false-negative on corporate firewalls that whitelist the API host
+  /// but block public CDN probe endpoints, and is cheaper in the happy
+  /// path (one request, not two).
+  Future<ConnectionHealthState> _runCheck() async {
+    var serverOk = false;
+    try {
+      final req = http.Request('GET', _uri)..followRedirects = false;
+      final res = await _httpClient.send(req).timeout(requestTimeout);
+      // Drain the body to free the connection back to the pool. v1 does
+      // not parse it; a future `degraded` state would.
+      await res.stream.drain<void>();
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        serverOk = true;
+      }
+    } on TimeoutException {
+      // Falls through to the disambiguation block below.
+    } on SocketException {
+      // Falls through.
+    } on http.ClientException {
+      // Falls through (covers `Client.send` errors after `close`).
+    } on Object {
+      // Any other failure (e.g. HandshakeException) — also a probe miss.
+    }
+
+    if (serverOk) return ConnectionHealthState.healthy;
+
+    // Server failed. Disambiguate via the generic internet probe.
+    bool hasInternet;
+    try {
+      hasInternet = await _internetChecker.hasInternetAccess;
+    } on Object {
+      hasInternet = false;
+    }
+    return hasInternet
+        ? ConnectionHealthState.serverUnreachable
+        : ConnectionHealthState.internetDisconnected;
+  }
+
+  /// Updates [_currentState] and emits on [_controller] only if the
+  /// state differs from the last emission. `initial` is a valid
+  /// previous-state baseline so the first non-`initial` observation
+  /// emits exactly one event.
+  void _emitIfChanged(ConnectionHealthState state) {
+    _currentState = state;
+    if (state == _lastState) return;
+    _lastState = state;
+    if (!_controller.isClosed) _controller.add(state);
+  }
+
+  /// Computes the next scheduled delay: `healthyInterval` when the
+  /// last observed state was `healthy`, else `retryInterval`, with
+  /// `±jitterRatio` random jitter applied uniformly. Inject a seeded
+  /// [Random] in tests for deterministic timing.
+  Duration _nextDelay(ConnectionHealthState state) {
+    final base = state == ConnectionHealthState.healthy
+        ? healthyInterval
+        : retryInterval;
+    if (jitterRatio == 0) return base;
+    final jitterMs =
+        (base.inMilliseconds * jitterRatio) * (_random.nextDouble() * 2 - 1);
+    final totalMs = base.inMilliseconds + jitterMs.toInt();
+    return Duration(milliseconds: totalMs < 0 ? 0 : totalMs);
+  }
+
+  /// Throws [StateError] if this monitor has been [dispose]d. Used by
+  /// every mutating public method.
+  void _throwIfDisposed() {
+    if (_disposed) {
+      throw StateError('ConnectionHealthMonitor has been disposed');
+    }
+  }
 
   /// Normalizes [baseUrl] + [healthPath] into a single [Uri] computed
   /// once at construction time:
