@@ -327,7 +327,7 @@ class ConnectionHealthMonitor {
   /// but block public CDN probe endpoints, and is cheaper in the happy
   /// path (one request, not two).
   Future<ConnectionHealthState> _runCheck() async {
-    bool serverOk = false;
+    var serverOk = false;
     try {
       // Wrap the entire probe (send + body drain) in a single timeout so
       // a server that returns headers quickly but dribbles the body
@@ -361,16 +361,20 @@ class ConnectionHealthMonitor {
         : ConnectionHealthState.internetDisconnected;
   }
 
-  /// Issues the `GET _uri` request, drains the response body (so the
-  /// connection returns to the HTTP pool), and reports whether the
-  /// server responded with 2xx. Wrapped in `requestTimeout` by the
-  /// caller — must not enforce its own timeout.
+  /// Issues the `GET _uri` request and reports whether the server
+  /// responded with 2xx. Wrapped in `requestTimeout` by the caller —
+  /// MUST NOT enforce its own timeout (would compound the budget).
+  ///
+  /// Drains the response body on every path so the pooled connection
+  /// is reusable. The outer `requestTimeout` bounds the drain, so a
+  /// pathological multi-megabyte error body still cannot hang the
+  /// loop past the budget.
   Future<bool> _probeServer() async {
     final req = http.Request('GET', _uri)..followRedirects = false;
     final res = await _httpClient.send(req);
     final ok = res.statusCode >= 200 && res.statusCode < 300;
-    // Drain the body to free the pooled connection. v1 does not parse
-    // it; a future `degraded` state would.
+    // Drain so the pooled connection is reusable. v1 ignores the body;
+    // a future `degraded` state would parse it here on the 2xx path.
     await res.stream.drain<void>();
     return ok;
   }
@@ -417,22 +421,28 @@ class ConnectionHealthMonitor {
   ///   produce `https://api.example.com/health`, never `...//health`).
   /// - Prepends a `/` to `healthPath` if missing.
   ///
-  /// Throws [ArgumentError] if [baseUrl] is not a valid absolute URL
-  /// with a scheme and authority (e.g. `https://api.example.com`).
+  /// Throws [ArgumentError] if [baseUrl] is not a valid absolute
+  /// http/https URL with a non-empty host and no query/fragment.
   /// `Uri.parse` alone is too permissive — `'not a url'` parses as an
-  /// opaque URI with no scheme, which would silently produce garbage
+  /// opaque URI; `'http://'` parses with `hasAuthority == true` but an
+  /// empty host; `'https://api.x?k=v'` would put `/health` inside the
+  /// query string. Each of those would silently produce garbage
   /// requests at probe time.
   static Uri _composeUri(String baseUrl, String healthPath) {
-    final trimmedBase = baseUrl.replaceFirst(RegExp(r'/+$'), '');
+    final trimmedBase = baseUrl.replaceFirst(_trailingSlashes, '');
     final parsed = Uri.tryParse(trimmedBase);
     if (parsed == null ||
         parsed.scheme.isEmpty ||
         !parsed.hasAuthority ||
+        parsed.host.isEmpty ||
+        parsed.query.isNotEmpty ||
+        parsed.fragment.isNotEmpty ||
         (parsed.scheme != 'http' && parsed.scheme != 'https')) {
       throw ArgumentError.value(
         baseUrl,
         'baseUrl',
-        'must be an absolute http/https URL (e.g. https://api.example.com)',
+        'must be an absolute http/https URL with a non-empty host and '
+            'no query/fragment (e.g. https://api.example.com)',
       );
     }
     final normalizedPath = healthPath.startsWith('/')
@@ -441,3 +451,8 @@ class ConnectionHealthMonitor {
     return Uri.parse('$trimmedBase$normalizedPath');
   }
 }
+
+/// Matches one or more trailing `/` characters. Hoisted to a top-level
+/// `final` so the constructor does not rebuild the pattern on every
+/// call.
+final RegExp _trailingSlashes = RegExp(r'/+$');
