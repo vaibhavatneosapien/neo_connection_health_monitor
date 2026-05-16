@@ -538,11 +538,16 @@ void main() {
           );
         }
         // Regression guard: if jitter were silently disabled, every
-        // delta would equal `base` exactly. Assert non-uniform spacing.
+        // delta would equal `base` exactly. Assert both jitter polarities.
         expect(
-          deltas.toSet().length,
-          greaterThan(1),
-          reason: 'all deltas equal — jitter likely disabled',
+          deltas.any((d) => d < 10000),
+          isTrue,
+          reason: 'no delta below base — negative jitter never fired',
+        );
+        expect(
+          deltas.any((d) => d > 10000),
+          isTrue,
+          reason: 'no delta above base — positive jitter never fired',
         );
       });
     });
@@ -602,9 +607,19 @@ void main() {
         reason: 'query string on baseUrl rejected',
       );
       expect(
+        () => ConnectionHealthMonitor(baseUrl: 'https://api.example.com?'),
+        throwsArgumentError,
+        reason: 'empty query marker on baseUrl rejected',
+      );
+      expect(
         () => ConnectionHealthMonitor(baseUrl: 'https://api.example.com#frag'),
         throwsArgumentError,
         reason: 'fragment on baseUrl rejected',
+      );
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: 'https://api.example.com#'),
+        throwsArgumentError,
+        reason: 'empty fragment marker on baseUrl rejected',
       );
     });
 

@@ -432,11 +432,10 @@ class ConnectionHealthMonitor {
     final trimmedBase = baseUrl.replaceFirst(_trailingSlashes, '');
     final parsed = Uri.tryParse(trimmedBase);
     if (parsed == null ||
-        parsed.scheme.isEmpty ||
         !parsed.hasAuthority ||
         parsed.host.isEmpty ||
-        parsed.query.isNotEmpty ||
-        parsed.fragment.isNotEmpty ||
+        parsed.hasQuery ||
+        parsed.hasFragment ||
         (parsed.scheme != 'http' && parsed.scheme != 'https')) {
       throw ArgumentError.value(
         baseUrl,
@@ -445,9 +444,8 @@ class ConnectionHealthMonitor {
             'no query/fragment (e.g. https://api.example.com)',
       );
     }
-    final normalizedPath = healthPath.startsWith('/')
-        ? healthPath
-        : '/$healthPath';
+    final normalizedPath =
+        '/${healthPath.replaceFirst(RegExp(r'^/+'), '')}';
     return Uri.parse('$trimmedBase$normalizedPath');
   }
 }
