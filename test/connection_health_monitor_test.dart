@@ -1,4 +1,6 @@
-// Full 14-case behavioral test suite for `ConnectionHealthMonitor`.
+// Full behavioral test suite for `ConnectionHealthMonitor`. Covers all
+// 14 cases required by `CLAUDE.md` §Testing plus supplementary cases
+// added during code review (7b, 14b, 15, 15b, 16, 17, 18, 19).
 //
 // Uses:
 //   - `package:http/testing.dart` `MockClient` to fake the server probe.
@@ -65,18 +67,19 @@ ConnectionHealthMonitor _build({
 // ---------------------------------------------------------------------------
 
 void main() {
-  group('ConnectionHealthMonitor — 14 required cases', () {
+  group('ConnectionHealthMonitor — behavioral suite', () {
     // -------------------------------------------------------------------
     // 1: Internet down → internetDisconnected, retry scheduled ~1 min.
     // -------------------------------------------------------------------
     test('1: internet down → internetDisconnected, retry in retryInterval', () {
       fakeAsync((async) {
+        var hits = 0;
         final emissions = <ConnectionHealthState>[];
         final monitor = _build(
-          // Server probe fails (transport error) → falls through.
-          httpClient: MockClient(
-            (_) async => throw http.ClientException('no route'),
-          ),
+          httpClient: MockClient((_) async {
+            hits++;
+            throw http.ClientException('no route');
+          }),
           internetChecker: _FakeInternetConnection(online: false),
           retryInterval: const Duration(minutes: 1),
         );
@@ -85,15 +88,17 @@ void main() {
 
         async.flushMicrotasks();
         expect(emissions, [ConnectionHealthState.internetDisconnected]);
+        expect(hits, 1);
 
-        // Confirm a retry is scheduled at retryInterval (no jitter here).
+        // Retry is scheduled at retryInterval (no jitter here).
         async.elapse(const Duration(seconds: 59));
-        expect(emissions.length, 1, reason: 'no early re-emit');
+        expect(hits, 1, reason: 'no early re-poll');
         async.elapse(const Duration(seconds: 2));
         async.flushMicrotasks();
-        // De-dupe: still internetDisconnected, so no new emission, but the
-        // loop did run another check. We assert no crash + still 1 event.
-        expect(emissions.length, 1);
+        // De-dupe: still internetDisconnected, so no new emission, but
+        // the second HTTP attempt must have fired.
+        expect(emissions.length, 1, reason: 'de-dupe suppresses re-emit');
+        expect(hits, 2, reason: 'retry actually ran the probe');
 
         monitor.dispose();
       });
@@ -496,12 +501,12 @@ void main() {
     // 14b: Integration jitter check — with a seeded Random, the scheduler
     // actually fires within the band (not just the formula).
     // -------------------------------------------------------------------
-    test('14b: scheduler honors ±10% jitter band', () {
+    test('14b: every scheduled cycle fires inside the ±10% jitter band', () {
       fakeAsync((async) {
-        var hits = 0;
+        final fireTimes = <Duration>[];
         final monitor = _build(
           httpClient: MockClient((_) async {
-            hits++;
+            fireTimes.add(async.elapsed);
             return http.Response('ok', 200);
           }),
           internetChecker: _FakeInternetConnection(online: true),
@@ -510,18 +515,89 @@ void main() {
           random: Random(42),
         );
         monitor.start();
+        // Run long enough that ~6 cycles fire — exercises multiple
+        // successive nextDouble() outputs (both jitter polarities).
+        async.elapse(const Duration(seconds: 60));
         async.flushMicrotasks();
-        expect(hits, 1);
+        monitor.dispose();
 
-        // 9s — strictly inside the 0.9*base lower bound. No emit.
-        async.elapse(const Duration(seconds: 9));
-        async.flushMicrotasks();
-        expect(hits, 1, reason: 'before 0.9*base — no fire');
+        expect(
+          fireTimes.length,
+          greaterThanOrEqualTo(5),
+          reason: 'at least 5 cycles in 60s',
+        );
+        // Every inter-fire delta must land inside [0.9*base, 1.1*base].
+        for (var i = 1; i < fireTimes.length; i++) {
+          final deltaMs = (fireTimes[i] - fireTimes[i - 1]).inMilliseconds;
+          expect(
+            deltaMs,
+            inInclusiveRange(9000, 11000),
+            reason: 'cycle ${i + 1} delta $deltaMs ms outside ±10% band',
+          );
+        }
+      });
+    });
 
-        // Elapse the 2s window covering [0.9*base, 1.1*base]. Must fire.
-        async.elapse(const Duration(seconds: 2));
+    // -------------------------------------------------------------------
+    // 17: post-dispose stream subscriber gets onDone, no phantom replay.
+    // -------------------------------------------------------------------
+    test('17: post-dispose subscriber → onDone, no phantom event', () async {
+      final monitor = ConnectionHealthMonitor(
+        baseUrl: 'https://api.example.com',
+        httpClient: MockClient((_) async => http.Response('ok', 200)),
+        internetChecker: _FakeInternetConnection(online: true),
+      );
+      monitor.start();
+      // Let the first check land so currentState is non-initial.
+      await Future<void>.delayed(Duration.zero);
+      await monitor.dispose();
+
+      final events = <ConnectionHealthState>[];
+      var done = false;
+      monitor.stream.listen(events.add, onDone: () => done = true);
+      await Future<void>.delayed(Duration.zero);
+      expect(events, isEmpty, reason: 'no phantom replay after dispose');
+      expect(done, isTrue, reason: 'late subscriber gets onDone');
+    });
+
+    // -------------------------------------------------------------------
+    // 18: invalid baseUrl throws ArgumentError at construction.
+    // -------------------------------------------------------------------
+    test('18: invalid baseUrl throws ArgumentError', () {
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: 'not a url'),
+        throwsArgumentError,
+      );
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: 'ftp://example.com'),
+        throwsArgumentError,
+        reason: 'non-http(s) scheme rejected',
+      );
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: '//example.com'),
+        throwsArgumentError,
+        reason: 'missing scheme rejected',
+      );
+    });
+
+    // -------------------------------------------------------------------
+    // 19: multiple trailing slashes on baseUrl all collapse cleanly.
+    // -------------------------------------------------------------------
+    test('19: baseUrl with N trailing slashes produces no // in URL', () {
+      fakeAsync((async) {
+        Uri? capturedUrl;
+        final monitor = _build(
+          baseUrl: 'https://api.example.com///',
+          healthPath: '/health',
+          httpClient: MockClient((req) async {
+            capturedUrl = req.url;
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        monitor.start();
         async.flushMicrotasks();
-        expect(hits, 2, reason: 'within 0.9*base..1.1*base — must fire');
+        expect(capturedUrl?.toString(), 'https://api.example.com/health');
         monitor.dispose();
       });
     });

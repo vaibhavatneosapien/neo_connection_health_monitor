@@ -55,7 +55,8 @@ class ConnectionHealthMonitor {
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
   ///   (chosen over 5 s for 3G on tier-2 networks).
   /// - [jitterRatio] - fraction of the scheduled delay applied as
-  ///   +/- random jitter. Default: 0.1 (+/-10%). Set to 0 to disable.
+  ///   +/- random jitter. Default: 0.1 (+/-10%). Pass exactly `0.0` to
+  ///   disable jitter (the check is `jitterRatio == 0`, no epsilon).
   /// - [httpClient] - optional injected client. If `null`, the monitor
   ///   creates its own [http.Client] and closes it on [dispose]. An
   ///   injected client is never closed by the monitor.
@@ -101,8 +102,7 @@ class ConnectionHealthMonitor {
   final double jitterRatio;
 
   // ---------------------------------------------------------------------------
-  // Private state. ST-2 wires these up; for now they exist so the API
-  // surface and lifecycle contract are visible.
+  // Private state.
   // ---------------------------------------------------------------------------
 
   /// `true` if the monitor created [_httpClient] itself and is therefore
@@ -179,8 +179,15 @@ class ConnectionHealthMonitor {
   /// without waiting for the next transition. If no check has completed
   /// yet, no event is replayed — the next live emission will be the
   /// first one the subscriber sees.
+  ///
+  /// After [dispose], a new subscriber receives `onDone` immediately
+  /// (no phantom replay).
   Stream<ConnectionHealthState> get stream {
     return Stream<ConnectionHealthState>.multi((controller) {
+      if (_disposed) {
+        controller.close();
+        return;
+      }
       if (_currentState != ConnectionHealthState.initial) {
         controller.add(_currentState);
       }
@@ -320,24 +327,24 @@ class ConnectionHealthMonitor {
   /// but block public CDN probe endpoints, and is cheaper in the happy
   /// path (one request, not two).
   Future<ConnectionHealthState> _runCheck() async {
-    var serverOk = false;
+    bool serverOk = false;
     try {
-      final req = http.Request('GET', _uri)..followRedirects = false;
-      final res = await _httpClient.send(req).timeout(requestTimeout);
-      // Drain the body to free the connection back to the pool. v1 does
-      // not parse it; a future `degraded` state would.
-      await res.stream.drain<void>();
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        serverOk = true;
-      }
+      // Wrap the entire probe (send + body drain) in a single timeout so
+      // a server that returns headers quickly but dribbles the body
+      // cannot hang the loop past `requestTimeout`.
+      serverOk = await _probeServer().timeout(requestTimeout);
     } on TimeoutException {
       // Falls through to the disambiguation block below.
     } on SocketException {
       // Falls through.
     } on http.ClientException {
       // Falls through (covers `Client.send` errors after `close`).
-    } on Object {
-      // Any other failure (e.g. HandshakeException) — also a probe miss.
+    } on Exception {
+      // Any other transport-layer failure (HandshakeException, etc).
+      // We deliberately do NOT catch `Error` — programmer bugs
+      // (StateError, AssertionError, type errors) must propagate so they
+      // surface in development instead of being silently classified as
+      // `serverUnreachable`.
     }
 
     if (serverOk) return ConnectionHealthState.healthy;
@@ -346,12 +353,26 @@ class ConnectionHealthMonitor {
     bool hasInternet;
     try {
       hasInternet = await _internetChecker.hasInternetAccess;
-    } on Object {
+    } on Exception {
       hasInternet = false;
     }
     return hasInternet
         ? ConnectionHealthState.serverUnreachable
         : ConnectionHealthState.internetDisconnected;
+  }
+
+  /// Issues the `GET _uri` request, drains the response body (so the
+  /// connection returns to the HTTP pool), and reports whether the
+  /// server responded with 2xx. Wrapped in `requestTimeout` by the
+  /// caller — must not enforce its own timeout.
+  Future<bool> _probeServer() async {
+    final req = http.Request('GET', _uri)..followRedirects = false;
+    final res = await _httpClient.send(req);
+    final ok = res.statusCode >= 200 && res.statusCode < 300;
+    // Drain the body to free the pooled connection. v1 does not parse
+    // it; a future `degraded` state would.
+    await res.stream.drain<void>();
+    return ok;
   }
 
   /// Updates [_currentState] and emits on [_controller] only if the
@@ -391,16 +412,29 @@ class ConnectionHealthMonitor {
   /// Normalizes [baseUrl] + [healthPath] into a single [Uri] computed
   /// once at construction time:
   ///
-  /// - Strips a trailing `/` from `baseUrl` (so
-  ///   `https://api.example.com/` does not produce `...//health`).
+  /// - Strips ALL trailing `/` from `baseUrl` (so
+  ///   `https://api.example.com/` and `https://api.example.com//` both
+  ///   produce `https://api.example.com/health`, never `...//health`).
   /// - Prepends a `/` to `healthPath` if missing.
   ///
-  /// Throws [FormatException] (via [Uri.parse]) if the composed string
-  /// is not a parseable URI.
+  /// Throws [ArgumentError] if [baseUrl] is not a valid absolute URL
+  /// with a scheme and authority (e.g. `https://api.example.com`).
+  /// `Uri.parse` alone is too permissive — `'not a url'` parses as an
+  /// opaque URI with no scheme, which would silently produce garbage
+  /// requests at probe time.
   static Uri _composeUri(String baseUrl, String healthPath) {
-    final trimmedBase = baseUrl.endsWith('/')
-        ? baseUrl.substring(0, baseUrl.length - 1)
-        : baseUrl;
+    final trimmedBase = baseUrl.replaceFirst(RegExp(r'/+$'), '');
+    final parsed = Uri.tryParse(trimmedBase);
+    if (parsed == null ||
+        parsed.scheme.isEmpty ||
+        !parsed.hasAuthority ||
+        (parsed.scheme != 'http' && parsed.scheme != 'https')) {
+      throw ArgumentError.value(
+        baseUrl,
+        'baseUrl',
+        'must be an absolute http/https URL (e.g. https://api.example.com)',
+      );
+    }
     final normalizedPath = healthPath.startsWith('/')
         ? healthPath
         : '/$healthPath';
