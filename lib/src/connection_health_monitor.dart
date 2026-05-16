@@ -238,7 +238,7 @@ class ConnectionHealthMonitor {
   /// `AppLifecycleState.paused` / `inactive` / `detached` / `hidden`.
   ///
   /// For terminal cleanup at app shutdown, use [dispose] instead.
-  Future<void> stop() async {
+  void stop() {
     _throwIfDisposed();
     _running = false;
     _pendingTimer?.cancel();
@@ -285,11 +285,15 @@ class ConnectionHealthMonitor {
     _throwIfDisposed();
     _pendingTimer?.cancel();
     _pendingTimer = null;
+    // Bump generation to invalidate any concurrent in-flight `_loop`
+    // iteration. Without this, a `_loop._runCheck()` that started before
+    // `checkNow` and completes after would overwrite the timer we schedule
+    // below — resetting the schedule from the wrong point in time.
+    final gen = ++_generation;
     final state = await _runCheck();
     if (_disposed) return state;
     _currentState = state;
-    if (_running) {
-      final gen = _generation;
+    if (_running && gen == _generation) {
       _pendingTimer = Timer(_nextDelay(state), () {
         unawaited(_loop(gen));
       });
@@ -429,7 +433,7 @@ class ConnectionHealthMonitor {
   /// query string. Each of those would silently produce garbage
   /// requests at probe time.
   static Uri _composeUri(String baseUrl, String healthPath) {
-    final trimmedBase = baseUrl.replaceFirst(_trailingSlashes, '');
+    final trimmedBase = baseUrl.replaceAll(_trailingSlashes, '');
     final parsed = Uri.tryParse(trimmedBase);
     if (parsed == null ||
         !parsed.hasAuthority ||
@@ -444,13 +448,13 @@ class ConnectionHealthMonitor {
             'no query/fragment (e.g. https://api.example.com)',
       );
     }
-    final normalizedPath =
-        '/${healthPath.replaceFirst(RegExp(r'^/+'), '')}';
+    final normalizedPath = '/${healthPath.replaceFirst(_leadingSlashes, '')}';
     return Uri.parse('$trimmedBase$normalizedPath');
   }
 }
 
-/// Matches one or more trailing `/` characters. Hoisted to a top-level
-/// `final` so the constructor does not rebuild the pattern on every
-/// call.
+/// Matches one or more trailing `/` characters.
 final RegExp _trailingSlashes = RegExp(r'/+$');
+
+/// Matches one or more leading `/` characters.
+final RegExp _leadingSlashes = RegExp(r'^/+');
