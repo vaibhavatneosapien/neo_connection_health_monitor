@@ -525,5 +525,110 @@ void main() {
         monitor.dispose();
       });
     });
+
+    // -------------------------------------------------------------------
+    // 15: Late subscriber replay — a listener that subscribes AFTER the
+    // first check completes is immediately replayed `currentState`.
+    // (Closes the CLAUDE.md §5 late-subscriber-replay gap.)
+    // -------------------------------------------------------------------
+    test('15: late subscriber receives currentState replay', () {
+      fakeAsync((async) {
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('ok', 200)),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        // First check has now completed; currentState == healthy.
+        expect(monitor.currentState, ConnectionHealthState.healthy);
+
+        // Subscribe LATE — must immediately receive `healthy` without
+        // waiting for the next interval.
+        final late = <ConnectionHealthState>[];
+        monitor.stream.listen(late.add);
+        async.flushMicrotasks();
+        expect(late, [ConnectionHealthState.healthy]);
+        monitor.dispose();
+      });
+    });
+
+    test('15b: late subscriber gets NO replay before any check completes', () {
+      fakeAsync((async) {
+        // Use a Completer to keep the first check pending indefinitely.
+        final never = Completer<http.Response>();
+        final monitor = _build(
+          httpClient: MockClient((_) => never.future),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        // currentState is still `initial`.
+        expect(monitor.currentState, ConnectionHealthState.initial);
+
+        final late = <ConnectionHealthState>[];
+        monitor.stream.listen(late.add);
+        async.flushMicrotasks();
+        expect(late, isEmpty, reason: 'initial sentinel must NOT be replayed');
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 16: start/stop/start race — a stale in-flight check must NOT cause
+    // a second concurrent loop. The generation counter handles this.
+    // -------------------------------------------------------------------
+    test('16: stop() then start() during in-flight check — no double loop', () {
+      fakeAsync((async) {
+        var hits = 0;
+        // Driver completer for the first check; we hold it open while we
+        // toggle stop → start, then complete it. After completion the
+        // stale iteration must bail out (generation mismatch), so the
+        // total hit count must NOT double.
+        Completer<http.Response>? firstCheckGate = Completer();
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            if (firstCheckGate != null && !firstCheckGate!.isCompleted) {
+              final gate = firstCheckGate;
+              firstCheckGate = null;
+              return gate!.future;
+            }
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+          healthyInterval: const Duration(seconds: 10),
+        );
+
+        monitor.start();
+        async.flushMicrotasks();
+        expect(hits, 1, reason: 'first check fired');
+
+        // Toggle stop → start while the first check is still mid-await.
+        monitor.stop();
+        monitor.start();
+        async.flushMicrotasks();
+        // The new start spawned a fresh check immediately. The old check
+        // is still gated on the completer.
+        expect(hits, 2);
+
+        // Resolve the stale check. Its post-await guard MUST see the
+        // generation mismatch and bail — no third hit fires from a
+        // stale reschedule.
+        firstCheckGate?.complete(http.Response('ok', 200));
+        async.flushMicrotasks();
+
+        // Elapse just enough for the FRESH timer (healthyInterval = 10s)
+        // to fire once. If the stale loop had rescheduled, we'd see
+        // hits > 3 inside this window.
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          hits,
+          3,
+          reason: 'exactly one fresh-loop reschedule; stale loop bailed',
+        );
+        monitor.dispose();
+      });
+    });
   });
 }
