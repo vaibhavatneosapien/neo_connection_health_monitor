@@ -1,202 +1,135 @@
 # neo_connection_health_monitor
 
-Lightweight pure-Dart package that monitors **device internet connectivity** AND **your application server's reachability**, exposing the combined state as a real-time `Stream`.
+Pure-Dart package that monitors device internet connectivity AND a specific server's reachability, exposing real-time state via a broadcast `Stream`. It distinguishes "the user has no internet" from "our backend is down" so the consumer app can show the correct UI affordance for each.
 
-Stop showing a generic "No internet" banner when your servers are actually down. This package tells you *which* side broke.
-
-```
-┌─────┐  baseUrl + /health   ┌─────────┐   5 min healthy / 1 min retry   ┌──────────────┐
-│ App │ ───────────────────▶ │ Package │ ─────────────────────────────▶  │ Server /health│
-└─────┘                       └─────────┘                                 └──────────────┘
-                                  │
-                                  └── Stream<ConnectionHealthState> ──▶ UI (StreamBuilder)
-```
-
----
-
-## Features
-
-- **Dual-tier health check** — distinguishes "no internet" from "your server is down".
-- **Adaptive polling** — checks every 5 min when healthy, switches to 1 min retry on failure.
-- **Reactive stream API** — one broadcast `Stream` powers any number of widgets.
-- **Pure Dart** — no Flutter dependency. Works in CLI, server, and Flutter apps.
-- **Testable** — inject your own `http.Client` and connection checker for unit tests.
-- **Lightweight** — only two runtime deps: `http` + `internet_connection_checker_plus`.
-
-## Connection states
-
-| State | Meaning | Typical UI |
-|---|---|---|
-| `initial` | First check has not completed yet. | Show nothing / splash. |
-| `healthy` | Internet works AND server `/health` returned 2xx. | Hide banner. |
-| `internetDisconnected` | Device has no internet at all. | "Check your WiFi / data". |
-| `serverUnreachable` | Internet works, but your server is down or timing out. | "We're having trouble reaching our servers". |
+The package performs a server-first dual-tier check on an adaptive schedule (5 minutes between checks while healthy, 1 minute while unhealthy, both with ±10% jitter to avoid synchronized thundering-herd load) and emits state transitions on a de-duplicated broadcast `Stream<ConnectionHealthState>`.
 
 ## Install
 
-```yaml
-dependencies:
-  neo_connection_health_monitor: ^1.0.0
-```
-
-Then:
+The package is not yet published on pub.dev. For now, depend on it via path or git.
 
 ```bash
-dart pub get
+dart pub add neo_connection_health_monitor
+```
+
+Or, until publication, add a path / git dependency directly to your `pubspec.yaml`:
+
+```yaml
+dependencies:
+  neo_connection_health_monitor:
+    path: ../neo_connection_health_monitor
+```
+
+```yaml
+dependencies:
+  neo_connection_health_monitor:
+    git:
+      url: https://github.com/neosapien/neo_connection_health_monitor.git
+      ref: master
 ```
 
 ## Quick start
 
-### 1. Construct once at app startup
-
-This package is designed as a **singleton** — one instance per app, started in `main()` before `runApp()`, so the heartbeat runs continuously in the background.
-
-Recommended DI: [`get_it`](https://pub.dev/packages/get_it).
-
 ```dart
-// lib/di/service_locator.dart
-import 'package:get_it/get_it.dart';
-import 'package:neo_connection_health_monitor/neo_connection_health_monitor.dart';
+final monitor = ConnectionHealthMonitor(baseUrl: 'https://api.neosapien.xyz');
+monitor.start();
 
-final getIt = GetIt.instance;
+monitor.stream.listen((state) {
+  switch (state) {
+    case ConnectionHealthState.healthy:             /* hide banner */
+    case ConnectionHealthState.internetDisconnected:/* "Check your WiFi" */
+    case ConnectionHealthState.serverUnreachable:   /* "Our servers are down" */
+    case ConnectionHealthState.initial:             /* show nothing yet */
+  }
+});
 
-void setupLocator() {
-  getIt.registerSingleton<ConnectionHealthMonitor>(
-    ConnectionHealthMonitor(baseUrl: AppConfig.apiBaseUrl)..start(),
-  );
-}
+// On retry button (pure probe — does NOT emit on stream):
+final state = await monitor.checkNow();
+
+// On app background / foreground (caller's responsibility — see §8):
+monitor.stop();   // paused, can resume
+monitor.start();  // resumes
+
+// On app shutdown:
+await monitor.dispose();
 ```
 
+## Caller responsibility — backgrounding (REQUIRED)
+
+> The caller MUST call `monitor.stop()` when the app enters `AppLifecycleState.paused` / `inactive` and `monitor.start()` on resume. The package will not do this for you; doing so would force a Flutter dependency.
+
+**Why this matters.** In the unhealthy state the monitor polls every 1 minute. If the consumer leaves the monitor running while the app is backgrounded, that is 60 HTTP attempts + 60 radio wakeups per backgrounded hour — visible battery drain, avoidable cellular traffic, and the kind of behaviour that surfaces in App Store and Play Store battery / energy reviews. Observing app lifecycle is intentionally the caller's job because doing it inside the package would force a Flutter dependency and defeat the pure-Dart goal (this package needs to remain reusable in CLI tools, server-side Dart, and other non-Flutter contexts).
+
+## Lifecycle snippet — `WidgetsBindingObserver`
+
+Copy-paste-ready Flutter integration. Wire this once at app startup and you are done.
+
 ```dart
-// lib/main.dart
-void main() {
-  setupLocator();
-  runApp(const MyApp());
-}
-```
-
-### 2. Listen anywhere in the widget tree
-
-```dart
-import 'package:flutter/material.dart';
-import 'package:neo_connection_health_monitor/neo_connection_health_monitor.dart';
-
-class ConnectionBanner extends StatelessWidget {
-  const ConnectionBanner({super.key});
+class _AppLifecycleWatcher with WidgetsBindingObserver {
+  final ConnectionHealthMonitor monitor;
+  _AppLifecycleWatcher(this.monitor);
 
   @override
-  Widget build(BuildContext context) {
-    final monitor = getIt<ConnectionHealthMonitor>();
-
-    return StreamBuilder<ConnectionHealthState>(
-      stream: monitor.stream,
-      initialData: monitor.currentState,
-      builder: (context, snapshot) {
-        return switch (snapshot.data!) {
-          ConnectionHealthState.healthy ||
-          ConnectionHealthState.initial => const SizedBox.shrink(),
-          ConnectionHealthState.internetDisconnected =>
-            const _Banner(text: 'Check your internet connection'),
-          ConnectionHealthState.serverUnreachable =>
-            const _Banner(text: 'We\'re having trouble reaching our servers'),
-        };
-      },
-    );
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        monitor.start();
+        break;
+      case AppLifecycleState.paused:
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+        monitor.stop();
+        break;
+    }
   }
 }
+
+// In main() / top-level widget initState:
+final monitor = ConnectionHealthMonitor(baseUrl: '…');
+final watcher = _AppLifecycleWatcher(monitor);
+WidgetsBinding.instance.addObserver(watcher);
+monitor.start();
 ```
 
-### 3. Manual refresh (pull-to-refresh / retry button)
+## States
 
-```dart
-ElevatedButton(
-  onPressed: () => getIt<ConnectionHealthMonitor>().checkNow(),
-  child: const Text('Retry'),
-);
-```
+| State | Meaning | Recommended UI affordance |
+|---|---|---|
+| `initial` | First check has not completed yet. | Show nothing (loading). |
+| `healthy` | Server `/health` returned 2xx. | Hide banner. |
+| `internetDisconnected` | Server unreachable AND the generic internet probe also failed. | "Check your WiFi / mobile data". |
+| `serverUnreachable` | Server failed but the generic internet probe succeeded. | "Our servers are temporarily unreachable". |
 
-### 4. Clean up on shutdown
-
-```dart
-await getIt<ConnectionHealthMonitor>().stop();
-```
+The four states are intentional. UI needs to distinguish "fix your WiFi" (user can act) from "our servers are down" (user is stuck waiting) — do not collapse them.
 
 ## API
 
-```dart
-ConnectionHealthMonitor({
-  required String baseUrl,                     // your API base, e.g. https://api.example.com
-  String healthPath = '/health',               // appended to baseUrl
-  Duration healthyInterval = const Duration(minutes: 5),
-  Duration retryInterval   = const Duration(minutes: 1),
-  Duration requestTimeout  = const Duration(seconds: 5),
-  http.Client? httpClient,                     // inject for tests
-  InternetConnection? internetChecker,         // inject for tests
-});
+| Symbol | Summary |
+|---|---|
+| `stream` | Broadcast `Stream<ConnectionHealthState>`. De-duplicated; emits only on real state changes. |
+| `currentState` | Synchronous read of the last observed state. Returns `initial` before the first check completes — see warning below. |
+| `start()` | Begins (or resumes) the polling loop. The first check fires immediately. Idempotent. |
+| `stop()` | Pause. Cancels the pending timer and clears the running flag; leaves the stream controller open so a later `start()` resumes cleanly. |
+| `dispose()` | Terminal cleanup. Cancels the timer, closes the broadcast controller, and closes the owned `http.Client` (an injected client is never closed). Any subsequent call throws `StateError`. |
+| `checkNow()` | One-off probe. Returns the observed state. **Does NOT emit on the stream.** Resets the schedule so the next polling delay is measured from the probe's completion. |
 
-Stream<ConnectionHealthState> get stream;      // broadcast — multi-listener safe
-ConnectionHealthState         get currentState;// last emitted value
+Notes:
 
-void start();                                  // idempotent
-Future<void> stop();                           // cancels loop + closes stream
-Future<ConnectionHealthState> checkNow();      // forces immediate check
+- **`stop()` vs `dispose()` — pause vs terminal.** `stop()` is the recommended call from `AppLifecycleState.paused` / `inactive` / `detached` / `hidden`; the monitor can be resumed with `start()`. `dispose()` is the call at app shutdown; the monitor cannot be reused afterwards.
+- **`checkNow()` does NOT emit on the stream.** It is a pure probe — use the returned `Future<ConnectionHealthState>` to drive a button spinner or toast locally. Consumers that expect a stream emission will get silent breakage; subscribe to `stream` for emissions, await `checkNow()` for the return value.
+- **`currentState` returns `initial` before the first check.** Do not render UI from a synchronous read of `currentState` immediately after construction — subscribe to `stream` and react to the first emitted event instead.
+
+## Why a pure-Dart package?
+
+The package intentionally avoids a Flutter dependency so it is reusable in CLI tools, server-side Dart services, and any future non-Flutter context. The trade-off is that the package cannot observe `AppLifecycleState` itself — the consumer must wire `WidgetsBindingObserver` and call `stop()` / `start()` on background / foreground transitions (see "Caller responsibility — backgrounding" above). This is a deliberate design choice, not an oversight; the pure-Dart constraint is load-bearing.
+
+## Development
+
+Run the full local quality gate (format check, analyzer, tests) before committing:
+
+```bash
+bash tool/check.sh
 ```
 
-## How the check works
-
-The package runs an adaptive loop. Each tick performs two checks **in order**:
-
-1. **Internet check** (`internet_connection_checker_plus`) — verifies the device can actually reach the open internet, not just a captive WiFi portal.
-   - Fails → emit `internetDisconnected`, schedule next check in **1 min**.
-2. **Server check** — sends a `GET` to `{baseUrl}{healthPath}` with a 5s timeout.
-   - 2xx → emit `healthy`, schedule next check in **5 min**.
-   - Non-2xx / timeout / network error → emit `serverUnreachable`, schedule next check in **1 min**.
-
-Duplicate consecutive states are de-duped — the stream only emits on real transitions.
-
-The loop uses recursive `Future.delayed` (not `Timer.periodic`) so checks cannot overlap if a request hangs near the timeout.
-
-## Server requirements
-
-Your backend must expose the health endpoint (default `/health`). It should:
-
-- Return **200 OK** when the service is healthy.
-- Be **cheap** — no DB queries, no auth. Just `200`.
-- Be **fast** — respond within the request timeout (5s default).
-
-Example (Express):
-
-```js
-app.get('/health', (_, res) => res.sendStatus(200));
-```
-
-Override the path if your server uses a different route:
-
-```dart
-ConnectionHealthMonitor(
-  baseUrl: 'https://api.example.com',
-  healthPath: '/api/v1/ping',
-);
-```
-
-## Testing
-
-Inject fakes so tests never hit the network:
-
-```dart
-final monitor = ConnectionHealthMonitor(
-  baseUrl: 'https://fake.test',
-  httpClient: MockClient((req) async => http.Response('', 200)),
-  internetChecker: FakeInternetConnection(hasConnection: true),
-);
-```
-
-Use `package:fake_async` for deterministic time control of the polling loop.
-
-## Why this exists
-
-Most "connectivity" packages only tell you whether the device has a WiFi/cellular interface up — which lies to you constantly (captive portals, your servers being down, DNS failures). This package answers the only question your UI actually cares about: **can the user use my app right now, and if not, whose fault is it?**
-
-## License
-
-BSD-3-Clause (or whatever the project decides at publish time — update before pushing to pub.dev).
+The same script powers the GitHub Actions workflow on every PR and push to `master`, so passing it locally is the cheapest way to keep CI green.
