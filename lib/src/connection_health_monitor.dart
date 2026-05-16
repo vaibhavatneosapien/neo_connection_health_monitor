@@ -146,6 +146,14 @@ class ConnectionHealthMonitor {
   /// [dispose] can cancel it cleanly.
   Timer? _pendingTimer;
 
+  /// Monotonically increasing generation counter. Bumped on every [start]
+  /// call. Loop iterations capture the generation at entry; if it changes
+  /// (e.g. `stop()` → `start()` fires a fresh run while a prior check is
+  /// still mid-await), the stale iteration bails out instead of emitting
+  /// and rescheduling — preventing concurrent loops doubling the request
+  /// rate.
+  int _generation = 0;
+
   /// Cached most-recent state. Returned by [currentState] and used as
   /// the de-dupe baseline; starts as [ConnectionHealthState.initial].
   ConnectionHealthState _currentState = ConnectionHealthState.initial;
@@ -164,10 +172,26 @@ class ConnectionHealthMonitor {
   /// supported. Emissions are de-duplicated - the same state is never
   /// emitted twice in a row.
   ///
-  /// New subscribers do NOT automatically receive the most recent
-  /// state; read [currentState] if you need the value synchronously,
-  /// but heed the warning on that getter.
-  Stream<ConnectionHealthState> get stream => _controller.stream;
+  /// **Replay semantics:** a new subscriber is immediately replayed
+  /// [currentState] if at least one check has completed
+  /// (i.e. `currentState != initial`). This lets a `StreamBuilder` that
+  /// mounts AFTER the first check still receive the current state
+  /// without waiting for the next transition. If no check has completed
+  /// yet, no event is replayed — the next live emission will be the
+  /// first one the subscriber sees.
+  Stream<ConnectionHealthState> get stream {
+    return Stream<ConnectionHealthState>.multi((controller) {
+      if (_currentState != ConnectionHealthState.initial) {
+        controller.add(_currentState);
+      }
+      final sub = _controller.stream.listen(
+        controller.add,
+        onError: controller.addError,
+        onDone: controller.close,
+      );
+      controller.onCancel = sub.cancel;
+    });
+  }
 
   /// The most recently observed state, or
   /// [ConnectionHealthState.initial] if no check has completed yet.
@@ -189,8 +213,13 @@ class ConnectionHealthMonitor {
     _throwIfDisposed();
     if (_running) return;
     _running = true;
+    // Bump generation so any stale in-flight loop iteration from a prior
+    // start()/stop() cycle bails on its post-await guard instead of
+    // emitting and rescheduling — preventing concurrent loops doubling
+    // the request rate.
+    final gen = ++_generation;
     // Fire-and-forget: the loop self-schedules via Timer.
-    unawaited(_loop());
+    unawaited(_loop(gen));
   }
 
   /// Pauses the polling loop without tearing down the monitor.
@@ -253,8 +282,9 @@ class ConnectionHealthMonitor {
     if (_disposed) return state;
     _currentState = state;
     if (_running) {
+      final gen = _generation;
       _pendingTimer = Timer(_nextDelay(state), () {
-        unawaited(_loop());
+        unawaited(_loop(gen));
       });
     }
     return state;
@@ -266,14 +296,16 @@ class ConnectionHealthMonitor {
 
   /// One adaptive iteration: run the dual-tier check, emit on change,
   /// schedule the next iteration. Bails without emitting or scheduling
-  /// if [stop] or [dispose] fired while the check was in flight.
-  Future<void> _loop() async {
-    if (!_running || _disposed) return;
+  /// if [stop] or [dispose] fired while the check was in flight, or if
+  /// a fresh [start] cycle bumped [_generation] past [gen] (which means
+  /// a newer loop is already in flight).
+  Future<void> _loop(int gen) async {
+    if (!_running || _disposed || gen != _generation) return;
     final state = await _runCheck();
-    if (!_running || _disposed) return;
+    if (!_running || _disposed || gen != _generation) return;
     _emitIfChanged(state);
     _pendingTimer = Timer(_nextDelay(state), () {
-      unawaited(_loop());
+      unawaited(_loop(gen));
     });
   }
 
