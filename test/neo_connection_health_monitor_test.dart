@@ -1,42 +1,53 @@
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:neo_connection_health_monitor/neo_connection_health_monitor.dart';
 import 'package:test/test.dart';
 
-/// ST-1 only seeds a smoke test that the skeleton compiles and the
-/// public API surface exists. The full 14-case suite lands in ST-3.
+/// ST-2 smoke tests verifying the public API surface is wired (not the
+/// 14-case behavioral suite — that lands in ST-3). Uses a `MockClient`
+/// so no real network traffic is made.
 void main() {
-  group('ConnectionHealthMonitor (skeleton)', () {
+  group('ConnectionHealthMonitor', () {
     test('exposes initial state immediately after construction', () {
       final monitor = ConnectionHealthMonitor(
         baseUrl: 'https://api.example.com',
+        httpClient: MockClient((_) async => http.Response('ok', 200)),
       );
       expect(monitor.currentState, ConnectionHealthState.initial);
       expect(monitor.stream, isA<Stream<ConnectionHealthState>>());
     });
 
     test('normalizes baseUrl trailing slash + healthPath leading slash', () {
-      // Internal _uri is private; this test asserts the constructor does
-      // not throw on the canonical "both slashes" combo. The full URL
-      // shape is verified in ST-3 via injected http client.
       expect(
         () => ConnectionHealthMonitor(
           baseUrl: 'https://api.example.com/',
           healthPath: '/health',
+          httpClient: MockClient((_) async => http.Response('ok', 200)),
         ),
         returnsNormally,
       );
     });
 
-    test(
-      'start/stop/dispose/checkNow throw UnimplementedError (ST-2 stub)',
-      () {
-        final monitor = ConnectionHealthMonitor(
-          baseUrl: 'https://api.example.com',
-        );
-        expect(monitor.start, throwsA(isA<UnimplementedError>()));
-        expect(monitor.stop, throwsA(isA<UnimplementedError>()));
-        expect(monitor.dispose, throwsA(isA<UnimplementedError>()));
-        expect(monitor.checkNow, throwsA(isA<UnimplementedError>()));
-      },
-    );
+    test('start() is idempotent — second call is a no-op', () {
+      final monitor = ConnectionHealthMonitor(
+        baseUrl: 'https://api.example.com',
+        httpClient: MockClient((_) async => http.Response('ok', 200)),
+      );
+      expect(monitor.start, returnsNormally);
+      expect(monitor.start, returnsNormally);
+    });
+
+    test('any public method after dispose() throws StateError', () async {
+      final monitor = ConnectionHealthMonitor(
+        baseUrl: 'https://api.example.com',
+        httpClient: MockClient((_) async => http.Response('ok', 200)),
+      );
+      await monitor.dispose();
+      expect(monitor.start, throwsA(isA<StateError>()));
+      expect(monitor.stop, throwsA(isA<StateError>()));
+      expect(monitor.checkNow, throwsA(isA<StateError>()));
+      // dispose() itself is idempotent — second call is a no-op, not a throw.
+      await monitor.dispose();
+    });
   });
 }
