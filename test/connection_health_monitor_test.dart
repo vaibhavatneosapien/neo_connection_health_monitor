@@ -526,15 +526,24 @@ void main() {
           greaterThanOrEqualTo(5),
           reason: 'at least 5 cycles in 60s',
         );
-        // Every inter-fire delta must land inside [0.9*base, 1.1*base].
+        final deltas = <int>[];
         for (var i = 1; i < fireTimes.length; i++) {
           final deltaMs = (fireTimes[i] - fireTimes[i - 1]).inMilliseconds;
+          deltas.add(deltaMs);
+          // Every inter-fire delta must land inside [0.9*base, 1.1*base].
           expect(
             deltaMs,
             inInclusiveRange(9000, 11000),
             reason: 'cycle ${i + 1} delta $deltaMs ms outside ±10% band',
           );
         }
+        // Regression guard: if jitter were silently disabled, every
+        // delta would equal `base` exactly. Assert non-uniform spacing.
+        expect(
+          deltas.toSet().length,
+          greaterThan(1),
+          reason: 'all deltas equal — jitter likely disabled',
+        );
       });
     });
 
@@ -548,14 +557,18 @@ void main() {
         internetChecker: _FakeInternetConnection(online: true),
       );
       monitor.start();
-      // Let the first check land so currentState is non-initial.
-      await Future<void>.delayed(Duration.zero);
+      // Pump until the first check has completed (currentState becomes
+      // non-initial). pumpEventQueue is more robust than a single
+      // Future.delayed(zero) — survives changes to the number of
+      // microtask hops inside _runCheck.
+      await pumpEventQueue();
+      expect(monitor.currentState, isNot(ConnectionHealthState.initial));
       await monitor.dispose();
 
       final events = <ConnectionHealthState>[];
       var done = false;
       monitor.stream.listen(events.add, onDone: () => done = true);
-      await Future<void>.delayed(Duration.zero);
+      await pumpEventQueue();
       expect(events, isEmpty, reason: 'no phantom replay after dispose');
       expect(done, isTrue, reason: 'late subscriber gets onDone');
     });
@@ -577,6 +590,21 @@ void main() {
         () => ConnectionHealthMonitor(baseUrl: '//example.com'),
         throwsArgumentError,
         reason: 'missing scheme rejected',
+      );
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: 'http://'),
+        throwsArgumentError,
+        reason: 'empty host rejected',
+      );
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: 'https://api.example.com?k=v'),
+        throwsArgumentError,
+        reason: 'query string on baseUrl rejected',
+      );
+      expect(
+        () => ConnectionHealthMonitor(baseUrl: 'https://api.example.com#frag'),
+        throwsArgumentError,
+        reason: 'fragment on baseUrl rejected',
       );
     });
 
