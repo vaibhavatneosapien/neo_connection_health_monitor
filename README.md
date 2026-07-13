@@ -1,4 +1,4 @@
-# neo_connection_health_monitor
+# neo_connection_health
 
 Pure-Dart package that monitors device internet connectivity AND a specific server's reachability, exposing real-time state via a broadcast `Stream`. It distinguishes "the user has no internet" from "our backend is down" so the consumer app can show the correct UI affordance for each.
 
@@ -6,25 +6,20 @@ The package performs a server-first dual-tier check on an adaptive schedule (5 m
 
 ## Install
 
-The package is not yet published on pub.dev. For now, depend on it via path or git.
-
-```bash
-dart pub add neo_connection_health_monitor
-```
-
-Or, until publication, add a path / git dependency directly to your `pubspec.yaml`:
+The package is not published on pub.dev and is not intended to be. Depend on
+it via a path or git dependency in your `pubspec.yaml`.
 
 ```yaml
 dependencies:
-  neo_connection_health_monitor:
-    path: ../neo_connection_health_monitor
+  neo_connection_health:
+    path: ../neo_connection_health
 ```
 
 ```yaml
 dependencies:
-  neo_connection_health_monitor:
+  neo_connection_health:
     git:
-      url: https://github.com/neosapien/neo_connection_health_monitor.git
+      url: https://github.com/neosapien/neo_connection_health.git
       ref: master
 ```
 
@@ -46,9 +41,9 @@ monitor.stream.listen((state) {
 // On retry button (pure probe — does NOT emit on stream):
 final state = await monitor.checkNow();
 
-// On app background / foreground (caller's responsibility — see §8):
-monitor.stop();   // paused, can resume
-monitor.start();  // resumes
+// On app background / foreground (caller's responsibility — see below):
+monitor.stop();   // on background (paused/detached/hidden) — can resume
+monitor.start();  // on resume
 
 // On app shutdown:
 await monitor.dispose();
@@ -56,7 +51,7 @@ await monitor.dispose();
 
 ## Caller responsibility — backgrounding (REQUIRED)
 
-> The caller MUST call `monitor.stop()` when the app enters `AppLifecycleState.paused` / `inactive` and `monitor.start()` on resume. The package will not do this for you; doing so would force a Flutter dependency.
+> The caller MUST call `monitor.stop()` when the app is backgrounded (`AppLifecycleState.paused` / `detached` / `hidden`) and `monitor.start()` on resume. The package will not do this for you; doing so would force a Flutter dependency. **Do not stop on `inactive`** — see the snippet note below.
 
 **Why this matters.** In the unhealthy state the monitor polls every 1 minute. If the consumer leaves the monitor running while the app is backgrounded, that is 60 HTTP attempts + 60 radio wakeups per backgrounded hour — visible battery drain, avoidable cellular traffic, and the kind of behaviour that surfaces in App Store and Play Store battery / energy reviews. Observing app lifecycle is intentionally the caller's job because doing it inside the package would force a Flutter dependency and defeat the pure-Dart goal (this package needs to remain reusable in CLI tools, server-side Dart, and other non-Flutter contexts).
 
@@ -76,10 +71,15 @@ class _AppLifecycleWatcher with WidgetsBindingObserver {
         monitor.start();
         break;
       case AppLifecycleState.paused:
-      case AppLifecycleState.inactive:
       case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
         monitor.stop();
+        break;
+      case AppLifecycleState.inactive:
+        // Do NOT stop here. On iOS `inactive` fires during transient
+        // foreground interruptions (control center, app switcher, Face ID
+        // / permission dialogs); stopping+resuming on each would issue a
+        // fresh immediate probe every time — request thrash, not savings.
         break;
     }
   }
@@ -116,7 +116,7 @@ The four states are intentional. UI needs to distinguish "fix your WiFi" (user c
 
 Notes:
 
-- **`stop()` vs `dispose()` — pause vs terminal.** `stop()` is the recommended call from `AppLifecycleState.paused` / `inactive` / `detached` / `hidden`; the monitor can be resumed with `start()`. `dispose()` is the call at app shutdown; the monitor cannot be reused afterwards.
+- **`stop()` vs `dispose()` — pause vs terminal.** `stop()` is the recommended call when the app is backgrounded (`AppLifecycleState.paused` / `detached` / `hidden` — NOT `inactive`, a transient iOS foreground state); the monitor can be resumed with `start()`. `dispose()` is the call at app shutdown; the monitor cannot be reused afterwards.
 - **`checkNow()` does NOT emit on the stream.** It is a pure probe — use the returned `Future<ConnectionHealthState>` to drive a button spinner or toast locally. Consumers that expect a stream emission will get silent breakage; subscribe to `stream` for emissions, await `checkNow()` for the return value.
 - **`currentState` returns `initial` before the first check.** Do not render UI from a synchronous read of `currentState` immediately after construction — subscribe to `stream` and react to the first emitted event instead.
 

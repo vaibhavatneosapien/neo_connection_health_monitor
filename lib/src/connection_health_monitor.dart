@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:http/http.dart' as http;
@@ -19,9 +18,12 @@ import 'connection_health_state.dart';
 /// ## Caller responsibility - backgrounding
 ///
 /// This is a pure-Dart package; it does NOT observe Flutter's app
-/// lifecycle. The caller MUST call [stop] when the app enters
-/// `AppLifecycleState.paused` / `inactive` / `detached` / `hidden` and
-/// call [start] again on `resumed`. Failing to do so causes the
+/// lifecycle. The caller MUST call [stop] when the app is backgrounded
+/// (`AppLifecycleState.paused` / `detached` / `hidden`) and call [start]
+/// again on `resumed`. Do NOT stop on `inactive` — on iOS that fires
+/// during transient foreground interruptions (control center, the app
+/// switcher, Face ID / permission dialogs), and each resume would issue
+/// a fresh immediate probe, thrashing requests. Failing to stop causes the
 /// monitor to continue polling (every 1 minute in the unhealthy state)
 /// while the app is backgrounded - visible battery drain and avoidable
 /// HTTP traffic.
@@ -61,9 +63,11 @@ class ConnectionHealthMonitor {
   ///   creates its own [http.Client] and closes it on [dispose]. An
   ///   injected client is never closed by the monitor.
   /// - [internetChecker] - optional injected internet probe. Used only
-  ///   as a tiebreaker when the server probe fails. If `null`, the
-  ///   default `InternetConnection()` from
-  ///   `internet_connection_checker_plus` is used.
+  ///   as a tiebreaker when the server probe fails. If `null`, a
+  ///   dedicated `InternetConnection.createInstance()` is created (NOT
+  ///   the app-wide singleton — the package owns and disposes it), per
+  ///   `internet_connection_checker_plus`'s guidance for third-party
+  ///   packages. An injected checker is never disposed by the monitor.
   /// - [random] - optional source of randomness for jitter. Inject a
   ///   seeded `Random(42)` in tests; defaults to `Random()` in
   ///   production.
@@ -77,11 +81,18 @@ class ConnectionHealthMonitor {
     http.Client? httpClient,
     InternetConnection? internetChecker,
     Random? random,
-  }) : _ownsClient = httpClient == null,
-       _httpClient = httpClient ?? http.Client(),
-       _internetChecker = internetChecker ?? InternetConnection(),
-       _random = random ?? Random(),
-       _uri = _composeUri(baseUrl, healthPath);
+  })  : assert(
+          jitterRatio >= 0 && jitterRatio < 1,
+          'jitterRatio must be in [0, 1); a value >= 1 lets negative jitter '
+          'clamp the delay to 0, producing back-to-back probe bursts.',
+        ),
+        _ownsClient = httpClient == null,
+        _ownsChecker = internetChecker == null,
+        _httpClient = httpClient ?? http.Client(),
+        _internetChecker =
+            internetChecker ?? InternetConnection.createInstance(),
+        _random = random ?? Random(),
+        _uri = _composeUri(baseUrl, healthPath);
 
   // ---------------------------------------------------------------------------
   // Configuration (immutable after construction).
@@ -98,7 +109,9 @@ class ConnectionHealthMonitor {
   final Duration requestTimeout;
 
   /// Fraction of the scheduled delay applied as +/- random jitter.
-  /// `0.1` means +/-10%. Must be `>= 0`.
+  /// `0.1` means +/-10%. Must be in `[0, 1)` (asserted at construction):
+  /// a value `>= 1` lets negative jitter exceed the base delay, which the
+  /// clamp floors to 0 -> immediate back-to-back re-probes.
   final double jitterRatio;
 
   // ---------------------------------------------------------------------------
@@ -109,6 +122,12 @@ class ConnectionHealthMonitor {
   /// responsible for closing it on [dispose]. An injected client is
   /// owned by the caller and must never be closed here.
   final bool _ownsClient;
+
+  /// `true` if the monitor created [_internetChecker] itself (via
+  /// `createInstance()`) and must therefore dispose it on [dispose] to
+  /// free its internal timers/controllers. An injected checker is owned
+  /// by the caller and must never be disposed here.
+  final bool _ownsChecker;
 
   /// Pre-composed request URI. Built once at construction time so the
   /// hot path does not repeat URL parsing/normalization on every check.
@@ -182,23 +201,44 @@ class ConnectionHealthMonitor {
   ///
   /// After [dispose], a new subscriber receives `onDone` immediately
   /// (no phantom replay).
-  Stream<ConnectionHealthState> get stream {
-    return Stream<ConnectionHealthState>.multi((controller) {
-      if (_disposed) {
-        controller.close();
-        return;
-      }
-      if (_currentState != ConnectionHealthState.initial) {
-        controller.add(_currentState);
-      }
-      final sub = _controller.stream.listen(
-        controller.add,
-        onError: controller.addError,
-        onDone: controller.close,
-      );
-      controller.onCancel = sub.cancel;
-    });
-  }
+  Stream<ConnectionHealthState> get stream => _stream;
+
+  /// Backing broadcast-with-replay stream. Built once (not rebuilt on
+  /// every `stream` access) so `StreamBuilder(stream: monitor.stream)`
+  /// keeps a stable stream identity across widget rebuilds — otherwise
+  /// each rebuild would tear down and re-subscribe. `Stream.multi` still
+  /// re-runs the callback below per subscriber, so replay and
+  /// per-subscriber de-dupe are unaffected.
+  late final Stream<ConnectionHealthState> _stream =
+      Stream<ConnectionHealthState>.multi((controller) {
+    if (_disposed) {
+      controller.close();
+      return;
+    }
+    ConnectionHealthState? replayed;
+    if (_currentState != ConnectionHealthState.initial) {
+      replayed = _currentState;
+      controller.add(_currentState);
+    }
+    final sub = _controller.stream.listen(
+      (state) {
+        // Per-subscriber de-dupe: a silent `checkNow()` can move
+        // `_currentState` ahead of the broadcast de-dupe baseline
+        // (`_lastState`), so a late subscriber that just replayed the
+        // fresh value would otherwise receive the same value again when
+        // the next loop tick re-emits it. Drop that first repeat.
+        if (replayed != null) {
+          final justReplayed = replayed;
+          replayed = null;
+          if (state == justReplayed) return;
+        }
+        controller.add(state);
+      },
+      onError: controller.addError,
+      onDone: controller.close,
+    );
+    controller.onCancel = sub.cancel;
+  });
 
   /// The most recently observed state, or
   /// [ConnectionHealthState.initial] if no check has completed yet.
@@ -234,8 +274,9 @@ class ConnectionHealthMonitor {
   /// Cancels the pending timer and clears the running flag. The
   /// broadcast [stream] controller stays open, and any owned
   /// [http.Client] is NOT closed - so a subsequent [start] resumes
-  /// polling cleanly. This is the right call from
-  /// `AppLifecycleState.paused` / `inactive` / `detached` / `hidden`.
+  /// polling cleanly. This is the right call when the app is backgrounded
+  /// (`AppLifecycleState.paused` / `detached` / `hidden`) - NOT on
+  /// `inactive`, which is a transient foreground state on iOS.
   ///
   /// For terminal cleanup at app shutdown, use [dispose] instead.
   void stop() {
@@ -259,13 +300,21 @@ class ConnectionHealthMonitor {
     _pendingTimer?.cancel();
     _pendingTimer = null;
     await _controller.close();
-    if (_ownsClient) {
-      try {
-        _httpClient.close();
-      } on Object {
-        // Swallow: the client may already be mid-request and closing it
-        // can raise; the in-flight guard in `_loop` drops the result.
-      }
+    if (_ownsClient) await _closeQuietly(_httpClient.close);
+    if (_ownsChecker) await _closeQuietly(_internetChecker.dispose);
+  }
+
+  /// Runs a resource-release [action] during terminal disposal, swallowing
+  /// anything it throws. Cleanup must not surface — the client may be
+  /// mid-request when closed (the `_loop` in-flight guard drops its
+  /// result), and a checker override could raise. Unlike `_runCheck` (which
+  /// narrows to `on Exception` so programmer-bug `Error`s propagate in
+  /// development), disposal is terminal, so every throwable is swallowed.
+  Future<void> _closeQuietly(FutureOr<void> Function() action) async {
+    try {
+      await action();
+    } on Object {
+      // Intentionally swallowed: see doc comment.
     }
   }
 
@@ -333,21 +382,23 @@ class ConnectionHealthMonitor {
   Future<ConnectionHealthState> _runCheck() async {
     var serverOk = false;
     try {
-      // Wrap the entire probe (send + body drain) in a single timeout so
-      // a server that returns headers quickly but dribbles the body
-      // cannot hang the loop past `requestTimeout`.
+      // Wrap the whole probe (send + body drain) in a single timeout so a
+      // server that returns headers quickly but dribbles the body cannot
+      // hang the loop past `requestTimeout`.
       serverOk = await _probeServer().timeout(requestTimeout);
     } on TimeoutException {
       // Falls through to the disambiguation block below.
-    } on SocketException {
-      // Falls through.
     } on http.ClientException {
-      // Falls through (covers `Client.send` errors after `close`).
+      // Falls through (covers `Client.send` errors after `close`; the
+      // IOClient also wraps `dart:io` `SocketException` as this type).
     } on Exception {
-      // Any other transport-layer failure (HandshakeException, etc).
-      // We deliberately do NOT catch `Error` — programmer bugs
-      // (StateError, AssertionError, type errors) must propagate so they
-      // surface in development instead of being silently classified as
+      // Any other transport-layer failure (HandshakeException, a raw
+      // SocketException, etc). This generic clause is the real backstop —
+      // it is why no `dart:io`-specific catch is needed, which in turn
+      // keeps this file free of a `dart:io` import so the package stays
+      // Web/WASM-capable. We deliberately do NOT catch `Error` — programmer
+      // bugs (StateError, AssertionError, type errors) must propagate so
+      // they surface in development instead of being silently classified as
       // `serverUnreachable`.
     }
 
@@ -366,19 +417,21 @@ class ConnectionHealthMonitor {
   }
 
   /// Issues the `GET _uri` request and reports whether the server
-  /// responded with 2xx. Wrapped in `requestTimeout` by the caller —
-  /// MUST NOT enforce its own timeout (would compound the budget).
+  /// responded with 2xx. Wrapped in `requestTimeout` by the caller.
   ///
-  /// Drains the response body on every path so the pooled connection
-  /// is reusable. The outer `requestTimeout` bounds the drain, so a
-  /// pathological multi-megabyte error body still cannot hang the
-  /// loop past the budget.
+  /// Drains the body so the pooled connection is reusable (a future
+  /// `degraded` state would parse the 2xx body here instead of discarding
+  /// it). Caveat: `Future.timeout` does not cancel its source, so a hung
+  /// body keeps the `drain()` subscription alive until the transport's own
+  /// idle timeout reclaims it. Self-limiting in practice — a health body is
+  /// a few bytes and LB/proxy idle timeouts (~60s) sit under the retry
+  /// cadence — so it's a caveat, not a live leak.
+  // ponytail: drain-on-timeout not cancelled; upgrade to a cancelable
+  // subscription if a real slow-body leak ever shows up in metrics.
   Future<bool> _probeServer() async {
     final req = http.Request('GET', _uri)..followRedirects = false;
     final res = await _httpClient.send(req);
     final ok = res.statusCode >= 200 && res.statusCode < 300;
-    // Drain so the pooled connection is reusable. v1 ignores the body;
-    // a future `degraded` state would parse it here on the 2xx path.
     await res.stream.drain<void>();
     return ok;
   }
@@ -406,7 +459,7 @@ class ConnectionHealthMonitor {
     final jitterMs =
         (base.inMilliseconds * jitterRatio) * (_random.nextDouble() * 2 - 1);
     final totalMs = base.inMilliseconds + jitterMs.toInt();
-    return Duration(milliseconds: totalMs < 0 ? 0 : totalMs);
+    return Duration(milliseconds: max(0, totalMs));
   }
 
   /// Throws [StateError] if this monitor has been [dispose]d. Used by

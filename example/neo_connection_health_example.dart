@@ -1,4 +1,4 @@
-import 'package:neo_connection_health_monitor/neo_connection_health_monitor.dart';
+import 'package:neo_connection_health/neo_connection_health.dart';
 
 /// Minimal demo: construct a monitor, subscribe to its stream, run for
 /// 30 seconds, then dispose cleanly.

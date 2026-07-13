@@ -1,6 +1,9 @@
 // Full behavioral test suite for `ConnectionHealthMonitor`. Covers all
 // 14 cases required by `CLAUDE.md` §Testing plus supplementary cases
-// added during code review (7b, 14b, 15, 15b, 16, 17, 18, 19).
+// added during code review (7b, 14b, 15, 15b, 16, 17, 18, 19) and the
+// post-review mend pass (20 timeout+offline, 21 dispose-in-flight,
+// 22 checkNow-before-start, 23 late-subscriber de-dupe, 24 jitter assert,
+// 25 injected-checker not disposed).
 //
 // Uses:
 //   - `package:http/testing.dart` `MockClient` to fake the server probe.
@@ -18,7 +21,7 @@ import 'package:fake_async/fake_async.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
-import 'package:neo_connection_health_monitor/neo_connection_health_monitor.dart';
+import 'package:neo_connection_health/neo_connection_health.dart';
 import 'package:test/test.dart';
 
 // ---------------------------------------------------------------------------
@@ -32,8 +35,20 @@ class _FakeInternetConnection extends InternetConnection {
 
   bool online;
 
+  /// Set true if the monitor ever calls [dispose] on this instance. Used to
+  /// verify the monitor never disposes an INJECTED checker (only one it
+  /// created itself is owned).
+  bool disposed = false;
+
   @override
   Future<bool> get hasInternetAccess async => online;
+
+  @override
+  Future<void> dispose() async {
+    disposed = true;
+    // Deliberately do NOT call super.dispose(): the base spins real timers
+    // this fake never started.
+  }
 }
 
 /// Builds a `ConnectionHealthMonitor` with all dependencies injected. All
@@ -323,9 +338,12 @@ void main() {
         async.flushMicrotasks();
         expect(probed, ConnectionHealthState.serverUnreachable);
         expect(monitor.currentState, ConnectionHealthState.serverUnreachable);
-        expect(emissions, [
-          ConnectionHealthState.healthy,
-        ], reason: 'checkNow must NEVER emit on stream');
+        expect(
+            emissions,
+            [
+              ConnectionHealthState.healthy,
+            ],
+            reason: 'checkNow must NEVER emit on stream');
         monitor.dispose();
       });
     });
@@ -748,6 +766,186 @@ void main() {
         );
         monitor.dispose();
       });
+    });
+
+    // -------------------------------------------------------------------
+    // 20: server timeout AND internet down → internetDisconnected.
+    // (Test 3 only covered timeout WITH internet up; this exercises the
+    // timeout → disambiguation → offline path, plus the in-probe
+    // send timeout.)
+    // -------------------------------------------------------------------
+    test('20: server timeout + internet down → internetDisconnected', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final never = Completer<http.Response>();
+        final monitor = _build(
+          httpClient: MockClient((_) => never.future),
+          internetChecker: _FakeInternetConnection(online: false),
+          requestTimeout: const Duration(seconds: 3),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.elapse(const Duration(seconds: 4));
+        async.flushMicrotasks();
+        expect(emissions, [ConnectionHealthState.internetDisconnected]);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 21: dispose() DURING an in-flight probe — the post-await guard in
+    // _loop must bail: no emission, no throw when the probe later resolves.
+    // -------------------------------------------------------------------
+    test('21: dispose() during in-flight probe — no emit, no throw', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final gate = Completer<http.Response>();
+        final monitor = _build(
+          httpClient: MockClient((_) => gate.future),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // First probe is gated (in flight). Tear down now.
+        monitor.dispose();
+        async.flushMicrotasks();
+        // Resolve the probe AFTER dispose — the loop's post-await guard
+        // must drop it silently.
+        gate.complete(http.Response('ok', 200));
+        async.flushMicrotasks();
+        expect(emissions, isEmpty, reason: 'no emission after dispose');
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 22: checkNow() BEFORE start() — probes once, updates currentState,
+    // and does NOT schedule a loop (nothing running to reschedule).
+    // -------------------------------------------------------------------
+    test('22: checkNow() before start() probes without scheduling', () {
+      fakeAsync((async) {
+        var hits = 0;
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+          healthyInterval: const Duration(seconds: 10),
+        );
+        monitor.stream.listen(emissions.add);
+
+        ConnectionHealthState? probed;
+        monitor.checkNow().then((s) => probed = s);
+        async.flushMicrotasks();
+        expect(probed, ConnectionHealthState.healthy);
+        expect(hits, 1);
+        expect(emissions, isEmpty, reason: 'checkNow never emits');
+        expect(monitor.currentState, ConnectionHealthState.healthy);
+
+        // No loop was scheduled (monitor never started).
+        async.elapse(const Duration(minutes: 5));
+        async.flushMicrotasks();
+        expect(hits, 1, reason: 'no scheduled loop without start()');
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 23: a state-changing checkNow() moves currentState ahead of the
+    // de-dupe baseline; a late subscriber must still receive the value
+    // only ONCE (per-subscriber de-dupe), not a duplicate when the next
+    // loop tick re-emits it.
+    // -------------------------------------------------------------------
+    test('23: no duplicate to late subscriber after state-changing checkNow',
+        () {
+      fakeAsync((async) {
+        var statusCode = 200;
+        final existing = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('', statusCode)),
+          internetChecker: _FakeInternetConnection(online: true),
+          healthyInterval: const Duration(seconds: 10),
+          retryInterval: const Duration(seconds: 5),
+        );
+        monitor.stream.listen(existing.add);
+        monitor.start();
+        async.flushMicrotasks();
+        expect(existing, [ConnectionHealthState.healthy]);
+
+        // Silent checkNow moves currentState → serverUnreachable without
+        // emitting; _lastState (de-dupe baseline) stays healthy.
+        statusCode = 500;
+        monitor.checkNow();
+        async.flushMicrotasks();
+        expect(monitor.currentState, ConnectionHealthState.serverUnreachable);
+        expect(existing, [ConnectionHealthState.healthy]);
+
+        // Late subscriber mounts on the divergence and replays the fresh
+        // currentState once.
+        final late = <ConnectionHealthState>[];
+        monitor.stream.listen(late.add);
+        async.flushMicrotasks();
+        expect(late, [ConnectionHealthState.serverUnreachable]);
+
+        // Next loop tick (retryInterval) re-observes serverUnreachable and
+        // broadcasts it to all subscribers.
+        async.elapse(const Duration(seconds: 6));
+        async.flushMicrotasks();
+        expect(existing, [
+          ConnectionHealthState.healthy,
+          ConnectionHealthState.serverUnreachable,
+        ]);
+        expect(
+          late,
+          [ConnectionHealthState.serverUnreachable],
+          reason: 'per-subscriber de-dupe suppresses the repeat',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 24: jitterRatio outside [0, 1) is rejected by the constructor assert.
+    // -------------------------------------------------------------------
+    test('24: jitterRatio outside [0, 1) throws AssertionError', () {
+      expect(
+        () => ConnectionHealthMonitor(
+          baseUrl: 'https://api.example.com',
+          jitterRatio: 1.0,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'jitterRatio >= 1 lets negative jitter clamp delay to 0',
+      );
+      expect(
+        () => ConnectionHealthMonitor(
+          baseUrl: 'https://api.example.com',
+          jitterRatio: -0.1,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'jitterRatio must be >= 0',
+      );
+    });
+
+    // -------------------------------------------------------------------
+    // 25: dispose() must NOT dispose an INJECTED internet checker (only a
+    // checker the monitor created itself is owned).
+    // -------------------------------------------------------------------
+    test('25: dispose() leaves an injected internet checker untouched',
+        () async {
+      final checker = _FakeInternetConnection(online: true);
+      final monitor = ConnectionHealthMonitor(
+        baseUrl: 'https://api.example.com',
+        httpClient: MockClient((_) async => http.Response('ok', 200)),
+        internetChecker: checker,
+      );
+      await monitor.dispose();
+      expect(
+        checker.disposed,
+        isFalse,
+        reason: 'injected checker is owned by the caller, never disposed here',
+      );
     });
   });
 }

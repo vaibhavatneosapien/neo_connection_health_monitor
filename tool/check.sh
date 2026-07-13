@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# tool/check.sh — local + CI quality gate for neo_connection_health_monitor.
+# tool/check.sh — local + CI quality gate for neo_connection_health.
 #
 # Runs the three checks the package contract guarantees:
 #   1. dart format --set-exit-if-changed .   (formatting drift fails the build)

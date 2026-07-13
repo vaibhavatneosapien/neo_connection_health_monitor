@@ -7,9 +7,11 @@
 /// Do not collapse [internetDisconnected] and [serverUnreachable] into a
 /// single "offline" state — they communicate different things to the user.
 enum ConnectionHealthState {
-  /// Emitted before the first health check completes. Acts as a starting
-  /// sentinel so consumers can distinguish "not yet checked" from
-  /// "checked and healthy/unhealthy".
+  /// The state before the first health check completes. Acts as a
+  /// starting sentinel so consumers can distinguish "not yet checked"
+  /// from "checked and healthy/unhealthy". Note: this value is never
+  /// emitted on `stream` (nor replayed to late subscribers) — it is only
+  /// ever observed via `currentState`.
   ///
   /// Do not render an error banner from this state — show a neutral
   /// placeholder (e.g. nothing) and wait for the first real emission.
