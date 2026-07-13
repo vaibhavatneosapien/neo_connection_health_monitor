@@ -1,4 +1,4 @@
-# NEO-1651: Build `neo_connection_health_monitor` Dart package (end-to-end)
+# NEO-1651: Build `neo_connection_health` Dart package (end-to-end)
 
 Parent branch: `feat/neo-1651-connection-health-monitor`
 Parent ticket: https://linear.app/neosapien/issue/NEO-1651/build-neo-connection-health-monitor-dart-package-end-to-end
@@ -9,8 +9,8 @@ Source of truth: `CLAUDE.md` in the repo root (implementation spec, severity-tag
 
 ### ST-1: Foundation — deps, enum, barrel, API skeleton
 
-- **Scope:** Add deps in `pubspec.yaml` (`http`, `internet_connection_checker_plus: ^3.0.0`; dev: `test`, `fake_async`, `lints`). Create `lib/src/connection_health_state.dart` with the 4-state enum and full dartdoc. Create `lib/src/connection_health_monitor.dart` with the `ConnectionHealthMonitor` class — full constructor signature, public method signatures (`start`, `stop`, `dispose`, `checkNow`, `stream`, `currentState`), `_running`/`_disposed`/`_ownsClient` fields, URL normalization in the constructor, dartdoc on every public symbol per `CLAUDE.md` §Conventions. All method bodies throw `UnimplementedError` so the package compiles and the API surface is stable. Wire `lib/neo_connection_health_monitor.dart` barrel exporting BOTH `ConnectionHealthMonitor` AND `ConnectionHealthState`. Delete placeholder `lib/src/neo_connection_health_monitor_base.dart`.
-- **Files likely touched:** `pubspec.yaml`, `lib/neo_connection_health_monitor.dart`, `lib/src/connection_health_state.dart`, `lib/src/connection_health_monitor.dart`, deletion of `lib/src/neo_connection_health_monitor_base.dart`.
+- **Scope:** Add deps in `pubspec.yaml` (`http`, `internet_connection_checker_plus: ^3.0.0`; dev: `test`, `fake_async`, `lints`). Create `lib/src/connection_health_state.dart` with the 4-state enum and full dartdoc. Create `lib/src/connection_health_monitor.dart` with the `ConnectionHealthMonitor` class — full constructor signature, public method signatures (`start`, `stop`, `dispose`, `checkNow`, `stream`, `currentState`), `_running`/`_disposed`/`_ownsClient` fields, URL normalization in the constructor, dartdoc on every public symbol per `CLAUDE.md` §Conventions. All method bodies throw `UnimplementedError` so the package compiles and the API surface is stable. Wire `lib/neo_connection_health.dart` barrel exporting BOTH `ConnectionHealthMonitor` AND `ConnectionHealthState`. Delete placeholder `lib/src/neo_connection_health_base.dart`.
+- **Files likely touched:** `pubspec.yaml`, `lib/neo_connection_health.dart`, `lib/src/connection_health_state.dart`, `lib/src/connection_health_monitor.dart`, deletion of `lib/src/neo_connection_health_base.dart`.
 - **Depends on:** none
 - **Isolation:** worktree
 - **Acceptance:**
@@ -51,12 +51,12 @@ Source of truth: `CLAUDE.md` in the repo root (implementation spec, severity-tag
 
 ### ST-4: Example, README, CHANGELOG
 
-- **Scope:** Write `example/neo_connection_health_monitor_example.dart` (minimal usage demo with a printing stream listener). Write README.md covering: purpose, install, public API summary, quick-reference consumer snippet, and the copy-paste `WidgetsBindingObserver` snippet from `CLAUDE.md` §8 with the loud "caller MUST call `stop()` on background" rule. Add an initial CHANGELOG.md entry (semver, dated section).
-- **Files likely touched:** `example/neo_connection_health_monitor_example.dart`, `README.md`, `CHANGELOG.md`.
+- **Scope:** Write `example/neo_connection_health_example.dart` (minimal usage demo with a printing stream listener). Write README.md covering: purpose, install, public API summary, quick-reference consumer snippet, and the copy-paste `WidgetsBindingObserver` snippet from `CLAUDE.md` §8 with the loud "caller MUST call `stop()` on background" rule. Add an initial CHANGELOG.md entry (semver, dated section).
+- **Files likely touched:** `example/neo_connection_health_example.dart`, `README.md`, `CHANGELOG.md`.
 - **Depends on:** ST-1
 - **Isolation:** worktree
 - **Acceptance:**
-  - `dart run example/neo_connection_health_monitor_example.dart` runs without crashing (will likely emit `serverUnreachable` against a fake URL — that's fine).
+  - `dart run example/neo_connection_health_example.dart` runs without crashing (will likely emit `serverUnreachable` against a fake URL — that's fine).
   - README includes the full `WidgetsBindingObserver` snippet.
   - README explicitly states "caller MUST call `stop()` on background" and explains why.
   - CHANGELOG has a `0.1.0` (or chosen initial version) entry dated 2026-05-16.
