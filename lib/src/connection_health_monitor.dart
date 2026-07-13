@@ -201,37 +201,44 @@ class ConnectionHealthMonitor {
   ///
   /// After [dispose], a new subscriber receives `onDone` immediately
   /// (no phantom replay).
-  Stream<ConnectionHealthState> get stream {
-    return Stream<ConnectionHealthState>.multi((controller) {
-      if (_disposed) {
-        controller.close();
-        return;
-      }
-      ConnectionHealthState? replayed;
-      if (_currentState != ConnectionHealthState.initial) {
-        replayed = _currentState;
-        controller.add(_currentState);
-      }
-      final sub = _controller.stream.listen(
-        (state) {
-          // Per-subscriber de-dupe: a silent `checkNow()` can move
-          // `_currentState` ahead of the broadcast de-dupe baseline
-          // (`_lastState`), so a late subscriber that just replayed the
-          // fresh value would otherwise receive the same value again when
-          // the next loop tick re-emits it. Drop that first repeat.
-          if (replayed != null) {
-            final justReplayed = replayed;
-            replayed = null;
-            if (state == justReplayed) return;
-          }
-          controller.add(state);
-        },
-        onError: controller.addError,
-        onDone: controller.close,
-      );
-      controller.onCancel = sub.cancel;
-    });
-  }
+  Stream<ConnectionHealthState> get stream => _stream;
+
+  /// Backing broadcast-with-replay stream. Built once (not rebuilt on
+  /// every `stream` access) so `StreamBuilder(stream: monitor.stream)`
+  /// keeps a stable stream identity across widget rebuilds — otherwise
+  /// each rebuild would tear down and re-subscribe. `Stream.multi` still
+  /// re-runs the callback below per subscriber, so replay and
+  /// per-subscriber de-dupe are unaffected.
+  late final Stream<ConnectionHealthState> _stream =
+      Stream<ConnectionHealthState>.multi((controller) {
+    if (_disposed) {
+      controller.close();
+      return;
+    }
+    ConnectionHealthState? replayed;
+    if (_currentState != ConnectionHealthState.initial) {
+      replayed = _currentState;
+      controller.add(_currentState);
+    }
+    final sub = _controller.stream.listen(
+      (state) {
+        // Per-subscriber de-dupe: a silent `checkNow()` can move
+        // `_currentState` ahead of the broadcast de-dupe baseline
+        // (`_lastState`), so a late subscriber that just replayed the
+        // fresh value would otherwise receive the same value again when
+        // the next loop tick re-emits it. Drop that first repeat.
+        if (replayed != null) {
+          final justReplayed = replayed;
+          replayed = null;
+          if (state == justReplayed) return;
+        }
+        controller.add(state);
+      },
+      onError: controller.addError,
+      onDone: controller.close,
+    );
+    controller.onCancel = sub.cancel;
+  });
 
   /// The most recently observed state, or
   /// [ConnectionHealthState.initial] if no check has completed yet.
@@ -293,21 +300,21 @@ class ConnectionHealthMonitor {
     _pendingTimer?.cancel();
     _pendingTimer = null;
     await _controller.close();
-    if (_ownsClient) {
-      try {
-        _httpClient.close();
-      } on Object {
-        // Swallow: the client may already be mid-request and closing it
-        // can raise; the in-flight guard in `_loop` drops the result.
-      }
-    }
-    if (_ownsChecker) {
-      try {
-        await _internetChecker.dispose();
-      } on Object {
-        // Swallow: disposing an internally-created checker must not
-        // surface — the monitor is already terminal.
-      }
+    if (_ownsClient) await _closeQuietly(_httpClient.close);
+    if (_ownsChecker) await _closeQuietly(_internetChecker.dispose);
+  }
+
+  /// Runs a resource-release [action] during terminal disposal, swallowing
+  /// anything it throws. Cleanup must not surface — the client may be
+  /// mid-request when closed (the `_loop` in-flight guard drops its
+  /// result), and a checker override could raise. Unlike `_runCheck` (which
+  /// narrows to `on Exception` so programmer-bug `Error`s propagate in
+  /// development), disposal is terminal, so every throwable is swallowed.
+  Future<void> _closeQuietly(FutureOr<void> Function() action) async {
+    try {
+      await action();
+    } on Object {
+      // Intentionally swallowed: see doc comment.
     }
   }
 
@@ -414,15 +421,11 @@ class ConnectionHealthMonitor {
   ///
   /// Drains the body so the pooled connection is reusable (a future
   /// `degraded` state would parse the 2xx body here instead of discarding
-  /// it). The caller's `requestTimeout` bounds how long the *loop* waits,
-  /// but note: `Future.timeout` does not cancel its source, so if the body
-  /// itself hangs, the underlying `drain()` subscription keeps consuming
-  /// the socket in the background until the transport's own idle timeout
-  /// reclaims it. In practice self-limiting — a health probe's body is a
-  /// few bytes and LB/proxy idle timeouts (~60s) sit well under the retry
-  /// cadence — so this is a documented caveat, not a live leak. A tidier
-  /// cancel-on-timeout drain proved not worth the harness friction for the
-  /// bounded downside.
+  /// it). Caveat: `Future.timeout` does not cancel its source, so a hung
+  /// body keeps the `drain()` subscription alive until the transport's own
+  /// idle timeout reclaims it. Self-limiting in practice — a health body is
+  /// a few bytes and LB/proxy idle timeouts (~60s) sit under the retry
+  /// cadence — so it's a caveat, not a live leak.
   // ponytail: drain-on-timeout not cancelled; upgrade to a cancelable
   // subscription if a real slow-body leak ever shows up in metrics.
   Future<bool> _probeServer() async {
@@ -456,7 +459,7 @@ class ConnectionHealthMonitor {
     final jitterMs =
         (base.inMilliseconds * jitterRatio) * (_random.nextDouble() * 2 - 1);
     final totalMs = base.inMilliseconds + jitterMs.toInt();
-    return Duration(milliseconds: totalMs < 0 ? 0 : totalMs);
+    return Duration(milliseconds: max(0, totalMs));
   }
 
   /// Throws [StateError] if this monitor has been [dispose]d. Used by
