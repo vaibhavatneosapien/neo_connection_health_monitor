@@ -1,4 +1,4 @@
-name: neo_connection_health_monitor
+name: neo_connection_health
 description: Pure Dart package that monitors device internet connectivity and a specific server's reachability, exposing real-time state via a Stream.
 version: 0.1.0
 # repository: https://github.com/my_org/my_repo

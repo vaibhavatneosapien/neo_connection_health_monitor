@@ -1,4 +1,4 @@
-# neo_connection_health_monitor
+# neo_connection_health
 
 Pure-Dart package that monitors device internet connectivity AND a specific server's reachability, exposing real-time state via a broadcast `Stream`. It distinguishes "the user has no internet" from "our backend is down" so the consumer app can show the correct UI affordance for each.
 
@@ -11,15 +11,15 @@ it via a path or git dependency in your `pubspec.yaml`.
 
 ```yaml
 dependencies:
-  neo_connection_health_monitor:
-    path: ../neo_connection_health_monitor
+  neo_connection_health:
+    path: ../neo_connection_health
 ```
 
 ```yaml
 dependencies:
-  neo_connection_health_monitor:
+  neo_connection_health:
     git:
-      url: https://github.com/neosapien/neo_connection_health_monitor.git
+      url: https://github.com/neosapien/neo_connection_health.git
       ref: master
 ```
 

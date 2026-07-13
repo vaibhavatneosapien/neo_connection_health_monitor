@@ -6,7 +6,7 @@ Guidance for Claude Code when working in this repository.
 
 ## Project
 
-**`neo_connection_health_monitor`** — pure Dart package that monitors device internet connectivity AND a specific server's reachability, exposing real-time state via a `Stream`.
+**`neo_connection_health`** — pure Dart package that monitors device internet connectivity AND a specific server's reachability, exposing real-time state via a `Stream`.
 
 Consumer is a Flutter app (Neosapien). The app passes its API base URL (e.g. `https://api.neosapien.xyz`) into the package; the package pings a `/health` route on that base URL on an adaptive schedule and streams state transitions back to the UI.
 
@@ -225,12 +225,12 @@ monitor.start();
 
 ```
 lib/
-  neo_connection_health_monitor.dart      # barrel: MUST export ConnectionHealthMonitor AND ConnectionHealthState
+  neo_connection_health.dart      # barrel: MUST export ConnectionHealthMonitor AND ConnectionHealthState
   src/
     connection_health_state.dart          # enum
     connection_health_monitor.dart        # service
 example/
-  neo_connection_health_monitor_example.dart  # minimal usage demo
+  neo_connection_health_example.dart  # minimal usage demo
 test/
   connection_health_monitor_test.dart     # unit tests with injected fakes
 tool/
@@ -239,9 +239,9 @@ docs/
   solutions/                              # documented solutions to past problems (bugs, decisions, patterns), by category, with YAML frontmatter (module, tags, problem_type); relevant when implementing or debugging in documented areas
 ```
 
-Rename existing `lib/src/neo_connection_health_monitor_base.dart` once real files exist — don't keep the placeholder.
+Rename existing `lib/src/neo_connection_health_base.dart` once real files exist — don't keep the placeholder.
 
-**Barrel exports.** `lib/neo_connection_health_monitor.dart` MUST export both `ConnectionHealthMonitor` AND `ConnectionHealthState`. If only the class is exported, consumers cannot pattern-match on the enum without importing `src/`, which leaks implementation paths and is fragile across refactors. Easy to forget; the barrel file must contain both `export 'src/connection_health_monitor.dart';` and `export 'src/connection_health_state.dart';`.
+**Barrel exports.** `lib/neo_connection_health.dart` MUST export both `ConnectionHealthMonitor` AND `ConnectionHealthState`. If only the class is exported, consumers cannot pattern-match on the enum without importing `src/`, which leaks implementation paths and is fragile across refactors. Easy to forget; the barrel file must contain both `export 'src/connection_health_monitor.dart';` and `export 'src/connection_health_state.dart';`.
 
 ## Testing
 
@@ -268,7 +268,7 @@ Required cases (the original plan listed 7; review added 8–14):
 
 ## Conventions
 
-- Public API lives in `lib/neo_connection_health_monitor.dart` (barrel). Re-export both `ConnectionHealthMonitor` AND `ConnectionHealthState`. Everything else in `lib/src/**` is implementation; do not re-export internal classes unless intentional.
+- Public API lives in `lib/neo_connection_health.dart` (barrel). Re-export both `ConnectionHealthMonitor` AND `ConnectionHealthState`. Everything else in `lib/src/**` is implementation; do not re-export internal classes unless intentional.
 - Document every public symbol with `///` dartdoc — `dart doc` should produce clean output. Specifically required:
   - Dartdoc on `stop()` AND `dispose()` must explicitly state the pause-vs-terminal distinction so IDE tooltips show it.
   - Dartdoc on `checkNow()` must state "does NOT emit on the stream" — silent breakage otherwise.

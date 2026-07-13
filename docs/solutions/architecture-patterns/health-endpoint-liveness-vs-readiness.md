@@ -17,7 +17,7 @@ tags: [health-endpoint, liveness, readiness, connectivity-monitor, fastapi, flee
 
 ## Context
 
-`neo_connection_health_monitor` polls `GET {baseUrl}/health` from every
+`neo_connection_health` polls `GET {baseUrl}/health` from every
 Neosapien device on an adaptive timer (5 min healthy, 1 min retry). Any
 non-2xx response is classified as `serverUnreachable` and drives a
 user-facing banner ("Our servers are down"). The backend `/health` route

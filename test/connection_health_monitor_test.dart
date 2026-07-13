@@ -21,7 +21,7 @@ import 'package:fake_async/fake_async.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
-import 'package:neo_connection_health_monitor/neo_connection_health_monitor.dart';
+import 'package:neo_connection_health/neo_connection_health.dart';
 import 'package:test/test.dart';
 
 // ---------------------------------------------------------------------------
