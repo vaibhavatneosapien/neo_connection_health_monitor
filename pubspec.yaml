@@ -4,7 +4,10 @@ version: 0.1.0
 # repository: https://github.com/my_org/my_repo
 
 environment:
-  sdk: ^3.11.1
+  # Match the consumer app (neo) floor. The code uses nothing past Dart
+  # 2.19 (Stream.multi); pinning to the dev-machine SDK would raise neo's
+  # effective floor and break `flutter pub get` on any older toolchain.
+  sdk: ^3.5.4
 
 # Add regular dependencies here.
 dependencies:

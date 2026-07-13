@@ -120,7 +120,10 @@ _runCheck():
     // falls through to disambiguation
 
   // Server failed. Was it our server, or the network?
-  if (!await internetChecker.hasConnection) return internetDisconnected
+  // NOTE: the v3 `_plus` API is `hasInternetAccess` (a Future<bool>
+  // getter), NOT `hasConnection` — the latter is the ORIGINAL package's
+  // API, which this package deliberately does not use.
+  if (!await internetChecker.hasInternetAccess) return internetDisconnected
   return serverUnreachable
 ```
 
@@ -232,6 +235,8 @@ test/
   connection_health_monitor_test.dart     # unit tests with injected fakes
 tool/
   check.sh                                # format + analyze + test; called by CI and pre-commit
+docs/
+  solutions/                              # documented solutions to past problems (bugs, decisions, patterns), by category, with YAML frontmatter (module, tags, problem_type); relevant when implementing or debugging in documented areas
 ```
 
 Rename existing `lib/src/neo_connection_health_monitor_base.dart` once real files exist — don't keep the placeholder.
