@@ -1,4 +1,4 @@
-/// The four states reported by [ConnectionHealthMonitor].
+/// The five states reported by [ConnectionHealthMonitor].
 ///
 /// Each maps 1:1 to a UI affordance. Keep [internetDisconnected] (user can
 /// act — fix WiFi) and [serverUnreachable] (user is stuck waiting on us)
@@ -19,6 +19,24 @@ enum ConnectionHealthState {
   /// status within the configured timeout. The device has working internet
   /// AND the server is reachable.
   healthy,
+
+  /// Emitted when the server probe SUCCEEDED but took longer than
+  /// `slowThreshold` to do so. The connection works; it is slow enough
+  /// that uploads will visibly lag.
+  ///
+  /// This is a latency verdict on one request, not a bandwidth
+  /// measurement — a single slow probe on an otherwise fine network will
+  /// report it. That is deliberate: the banner it drives is advisory
+  /// ("your memory will sync once the connection improves"), so a false
+  /// positive costs the user nothing, while a missed slow network leaves
+  /// them staring at a stalled upload with no explanation.
+  ///
+  /// Polled at `retryInterval`, not `healthyInterval` — a degraded
+  /// connection should be re-checked at the same cadence as a broken one
+  /// so recovery is noticed quickly.
+  ///
+  /// UI hint: "Weak Network" — no action available, capture continues.
+  weakNetwork,
 
   /// Emitted when the server probe failed AND the generic internet probe
   /// (Cloudflare / Apple captive / Google CDN — see

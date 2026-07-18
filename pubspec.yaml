@@ -11,6 +11,9 @@ environment:
 
 # Add regular dependencies here.
 dependencies:
+  # Used only for `clock.now()` in the probe-latency measurement, so
+  # `fake_async` can drive it in tests (it fakes Clock, never Stopwatch).
+  clock: ^1.1.1
   http: ^1.2.0
   internet_connection_checker_plus: ^3.0.0
 

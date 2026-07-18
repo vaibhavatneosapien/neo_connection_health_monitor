@@ -35,6 +35,7 @@ monitor.start();
 monitor.stream.listen((state) {
   switch (state) {
     case ConnectionHealthState.healthy:             /* hide banner */
+    case ConnectionHealthState.weakNetwork:         /* "Weak Network" */
     case ConnectionHealthState.internetDisconnected:/* "Check your WiFi" */
     case ConnectionHealthState.serverUnreachable:   /* "Our servers are down" */
     case ConnectionHealthState.initial:             /* show nothing yet */
@@ -115,11 +116,14 @@ monitor.start();
 | State | Meaning | Recommended UI affordance |
 |---|---|---|
 | `initial` | First check has not completed yet. | Show nothing (loading). |
-| `healthy` | The configured health endpoint returned 2xx. | Hide banner. |
+| `healthy` | The configured health endpoint returned 2xx within `slowThreshold`. | Hide banner. |
+| `weakNetwork` | The health endpoint returned 2xx but took longer than `slowThreshold` (default 3 s). | "Weak network — sync will resume when the connection improves". |
 | `internetDisconnected` | Server unreachable AND the generic internet probe also failed. | "Check your WiFi / mobile data". |
 | `serverUnreachable` | Server failed but the generic internet probe succeeded. | "Our servers are temporarily unreachable". |
 
-The four states are intentional. UI needs to distinguish "fix your WiFi" (user can act) from "our servers are down" (user is stuck waiting) — do not collapse them.
+The five states are intentional. UI needs to distinguish "fix your WiFi" (user can act) from "our servers are down" (user is stuck waiting) — do not collapse them.
+
+`weakNetwork` is a latency verdict on a single request, not a bandwidth measurement: one slow probe on an otherwise healthy network reports it. That is deliberate — the banner it drives is advisory, so a false positive costs nothing, while a missed slow network leaves the user staring at a stalled upload with no explanation. It polls at `retryInterval`, not `healthyInterval`, so recovery is noticed quickly.
 
 ## API
 

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:clock/clock.dart';
 import 'package:http/http.dart' as http;
 import 'package:internet_connection_checker_plus/internet_connection_checker_plus.dart';
 
@@ -48,6 +49,12 @@ class ConnectionHealthMonitor {
   ///   observation. Default: 1 minute.
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
   ///   (chosen over 5 s for 3G on tier-2 networks).
+  /// - [slowThreshold] - a probe that SUCCEEDS but takes longer than
+  ///   this reports [ConnectionHealthState.weakNetwork] instead of
+  ///   `healthy`. Default: 3 seconds. Must be `> Duration.zero` and
+  ///   `< requestTimeout` (asserted): at or above the timeout the probe
+  ///   is aborted before it could ever be judged slow, leaving
+  ///   `weakNetwork` unreachable.
   /// - [jitterRatio] - +/- random jitter fraction on each delay.
   ///   Default: 0.1 (+/-10%); pass `0.0` to disable. See the field for
   ///   the `[0, 1)` bound.
@@ -69,6 +76,7 @@ class ConnectionHealthMonitor {
     this.healthyInterval = const Duration(minutes: 5),
     this.retryInterval = const Duration(minutes: 1),
     this.requestTimeout = const Duration(seconds: 8),
+    this.slowThreshold = const Duration(seconds: 3),
     this.jitterRatio = 0.1,
     http.Client? httpClient,
     InternetConnection? internetChecker,
@@ -76,6 +84,10 @@ class ConnectionHealthMonitor {
   })  : assert(
           jitterRatio >= 0 && jitterRatio < 1,
           'jitterRatio must be in [0, 1)',
+        ),
+        assert(
+          slowThreshold > Duration.zero && slowThreshold < requestTimeout,
+          'slowThreshold must be in (0, requestTimeout)',
         ),
         _ownsClient = httpClient == null,
         _ownsChecker = internetChecker == null,
@@ -98,6 +110,10 @@ class ConnectionHealthMonitor {
 
   /// Per-request timeout for the server `/health` probe.
   final Duration requestTimeout;
+
+  /// Round-trip duration above which a SUCCESSFUL probe reports
+  /// [ConnectionHealthState.weakNetwork] instead of `healthy`.
+  final Duration slowThreshold;
 
   /// Fraction of the scheduled delay applied as +/- random jitter.
   /// `0.1` means +/-10%. Must be in `[0, 1)` (asserted at construction):
@@ -346,9 +362,10 @@ class ConnectionHealthMonitor {
     });
   }
 
-  /// Server-first dual-tier check. Returns `healthy` on a 2xx response
-  /// from the server probe. Otherwise disambiguates: if the generic
-  /// internet probe also fails, the device is offline
+  /// Server-first dual-tier check. On a 2xx response from the server
+  /// probe, returns `healthy` — or [ConnectionHealthState.weakNetwork] if
+  /// the round trip exceeded [slowThreshold]. Otherwise disambiguates: if
+  /// the generic internet probe also fails, the device is offline
   /// ([ConnectionHealthState.internetDisconnected]); else the server is
   /// the cause ([ConnectionHealthState.serverUnreachable]).
   ///
@@ -358,6 +375,10 @@ class ConnectionHealthMonitor {
   /// path (one request, not two).
   Future<ConnectionHealthState> _runCheck() async {
     var serverOk = false;
+    // `clock.now()` rather than `Stopwatch`: `fake_async` installs a fake
+    // `Clock` but leaves `Stopwatch` on the real wall clock, so a stopwatch
+    // here would read ~0 in every test regardless of elapsed virtual time.
+    final startedAt = clock.now();
     try {
       // Wrap the whole probe (send + body drain) in a single timeout so a
       // server that returns headers quickly but dribbles the body cannot
@@ -376,7 +397,11 @@ class ConnectionHealthMonitor {
       // propagate, not be misclassified as `serverUnreachable`.
     }
 
-    if (serverOk) return ConnectionHealthState.healthy;
+    if (serverOk) {
+      return clock.now().difference(startedAt) > slowThreshold
+          ? ConnectionHealthState.weakNetwork
+          : ConnectionHealthState.healthy;
+    }
 
     // Server failed. Disambiguate via the generic internet probe.
     bool hasInternet;

@@ -48,6 +48,10 @@ ConnectionHealthMonitor _build({
   Duration healthyInterval = const Duration(minutes: 5),
   Duration retryInterval = const Duration(minutes: 1),
   Duration requestTimeout = const Duration(seconds: 8),
+  // Defaults to half the (possibly overridden) requestTimeout rather than a
+  // fixed 3s, so a test that shortens requestTimeout below 3s does not trip
+  // the `slowThreshold < requestTimeout` assert.
+  Duration? slowThreshold,
   double jitterRatio = 0.0,
   Random? random,
   String baseUrl = 'https://api.example.com',
@@ -59,6 +63,8 @@ ConnectionHealthMonitor _build({
     healthyInterval: healthyInterval,
     retryInterval: retryInterval,
     requestTimeout: requestTimeout,
+    slowThreshold: slowThreshold ??
+        Duration(microseconds: requestTimeout.inMicroseconds ~/ 2),
     jitterRatio: jitterRatio,
     httpClient: httpClient,
     internetChecker: internetChecker,
@@ -930,6 +936,135 @@ void main() {
         checker.disposed,
         isFalse,
         reason: 'injected checker is owned by the caller, never disposed here',
+      );
+    });
+
+    // -------------------------------------------------------------------
+    // 26: a 2xx that takes longer than slowThreshold → weakNetwork, and it
+    // is polled at retryInterval (not healthyInterval) so recovery is seen
+    // quickly.
+    // -------------------------------------------------------------------
+    test('26: slow 200 → weakNetwork, next check at retryInterval', () {
+      fakeAsync((async) {
+        var hits = 0;
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            await Future<void>.delayed(const Duration(seconds: 4));
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+          slowThreshold: const Duration(seconds: 3),
+          requestTimeout: const Duration(seconds: 8),
+          healthyInterval: const Duration(minutes: 5),
+          retryInterval: const Duration(minutes: 1),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(emissions, [ConnectionHealthState.weakNetwork]);
+        expect(hits, 1);
+
+        // retryInterval (1 min) governs, not healthyInterval (5 min). The
+        // delay is measured from the check's COMPLETION (t=4s), so the next
+        // probe lands at t=64s — we are at t=5s here.
+        async.elapse(const Duration(seconds: 58));
+        async.flushMicrotasks();
+        expect(hits, 1, reason: 'no early re-probe');
+
+        async.elapse(const Duration(seconds: 2));
+        async.flushMicrotasks();
+        expect(hits, 2, reason: 'weakNetwork re-probes at retryInterval');
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 27: a 2xx faster than slowThreshold stays healthy — the latency
+    // branch must not hijack the happy path.
+    // -------------------------------------------------------------------
+    test('27: fast 200 → healthy, not weakNetwork', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            await Future<void>.delayed(const Duration(seconds: 1));
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+          slowThreshold: const Duration(seconds: 3),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 2));
+        async.flushMicrotasks();
+        expect(emissions, [ConnectionHealthState.healthy]);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 28: weakNetwork → healthy emits both (the new state participates in
+    // de-dupe like any other).
+    // -------------------------------------------------------------------
+    test('28: weakNetwork → healthy emits both transitions', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        var latency = const Duration(seconds: 4);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            await Future<void>.delayed(latency);
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+          slowThreshold: const Duration(seconds: 3),
+          retryInterval: const Duration(seconds: 30),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(emissions, [ConnectionHealthState.weakNetwork]);
+
+        // Network recovers before the next scheduled probe.
+        latency = const Duration(milliseconds: 100);
+        async.elapse(const Duration(seconds: 31));
+        async.flushMicrotasks();
+        expect(emissions, [
+          ConnectionHealthState.weakNetwork,
+          ConnectionHealthState.healthy,
+        ]);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 29: slowThreshold outside (0, requestTimeout) is a programmer error
+    // — at/above the timeout the probe aborts before it can be judged
+    // slow, so weakNetwork would be unreachable.
+    // -------------------------------------------------------------------
+    test('29: slowThreshold outside (0, requestTimeout) asserts', () {
+      expect(
+        () => ConnectionHealthMonitor(
+          baseUrl: 'https://api.example.com',
+          requestTimeout: const Duration(seconds: 8),
+          slowThreshold: const Duration(seconds: 8),
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'slowThreshold == requestTimeout makes weakNetwork dead code',
+      );
+      expect(
+        () => ConnectionHealthMonitor(
+          baseUrl: 'https://api.example.com',
+          slowThreshold: Duration.zero,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'slowThreshold must be > 0',
       );
     });
   });
