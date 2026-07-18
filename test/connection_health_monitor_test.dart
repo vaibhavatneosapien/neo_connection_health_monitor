@@ -52,6 +52,7 @@ ConnectionHealthMonitor _build({
   // fixed 3s, so a test that shortens requestTimeout below 3s does not trip
   // the `slowThreshold < requestTimeout` assert.
   Duration? slowThreshold,
+  int downConfirmationCount = 1,
   double jitterRatio = 0.0,
   Random? random,
   String baseUrl = 'https://api.example.com',
@@ -65,6 +66,7 @@ ConnectionHealthMonitor _build({
     requestTimeout: requestTimeout,
     slowThreshold: slowThreshold ??
         Duration(microseconds: requestTimeout.inMicroseconds ~/ 2),
+    downConfirmationCount: downConfirmationCount,
     jitterRatio: jitterRatio,
     httpClient: httpClient,
     internetChecker: internetChecker,
@@ -1066,6 +1068,251 @@ void main() {
         throwsA(isA<AssertionError>()),
         reason: 'slowThreshold must be > 0',
       );
+    });
+
+    // -------------------------------------------------------------------
+    // downConfirmationCount — a degraded state must be observed N times in
+    // a row before it reaches the stream. Recovery is never delayed.
+    // -------------------------------------------------------------------
+    group('downConfirmationCount', () {
+      /// Builds a monitor whose probe outcome is controlled by two mutable
+      /// closures, so a single test can walk it through a sequence of
+      /// different results.
+      ({
+        ConnectionHealthMonitor monitor,
+        List<ConnectionHealthState> emissions,
+        void Function(int status) setStatus,
+        void Function({required bool online}) setOnline,
+        int Function() hits,
+      }) harness({
+        int downConfirmationCount = 2,
+        Duration retryInterval = const Duration(seconds: 30),
+        Duration healthyInterval = const Duration(minutes: 5),
+      }) {
+        var status = 500;
+        var hitCount = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hitCount++;
+            return http.Response('', status);
+          }),
+          internetChecker: checker,
+          downConfirmationCount: downConfirmationCount,
+          retryInterval: retryInterval,
+          healthyInterval: healthyInterval,
+        );
+        monitor.stream.listen(emissions.add);
+        return (
+          monitor: monitor,
+          emissions: emissions,
+          setStatus: (s) => status = s,
+          setOnline: ({required bool online}) => checker.online = online,
+          hits: () => hitCount,
+        );
+      }
+
+      test('30: first bad probe is silent, second identical one emits', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks();
+          expect(h.emissions, isEmpty, reason: 'one blip must not alarm');
+
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.internetDisconnected]);
+          h.monitor.dispose();
+        });
+      });
+
+      test('31: a healthy probe between two bad ones resets the streak', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks();
+          expect(h.emissions, isEmpty);
+
+          // Recovers before confirmation, then fails again once.
+          h.setStatus(200);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.healthy]);
+
+          // Land exactly ONE bad probe: the post-healthy check is scheduled
+          // a healthyInterval out, and a second would follow a retryInterval
+          // later and legitimately confirm. Stop in between.
+          h.setStatus(500);
+          async.elapse(const Duration(minutes: 5, seconds: 5));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [ConnectionHealthState.healthy],
+            reason: 'the streak restarted, so one bad probe is unconfirmed',
+          );
+          h.monitor.dispose();
+        });
+      });
+
+      test('32: two DIFFERENT bad states in a row confirm neither', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks(); // probe 1 -> internetDisconnected
+
+          // Same failing server, but the internet probe now succeeds, so
+          // this reads as serverUnreachable rather than a repeat.
+          h.setOnline(online: true);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks(); // probe 2 -> serverUnreachable
+
+          expect(
+            h.emissions,
+            isEmpty,
+            reason: 'two different failures are not a consistent story',
+          );
+          expect(h.monitor.currentState, ConnectionHealthState.initial);
+          h.monitor.dispose();
+        });
+      });
+
+      test('33: each state confirms on its own run', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks();
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.internetDisconnected]);
+
+          h.setOnline(online: true);
+          async.elapse(const Duration(seconds: 31)); // restarts the run
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.internetDisconnected]);
+
+          async.elapse(const Duration(seconds: 31)); // confirms it
+          async.flushMicrotasks();
+          expect(h.emissions, [
+            ConnectionHealthState.internetDisconnected,
+            ConnectionHealthState.serverUnreachable,
+          ]);
+          h.monitor.dispose();
+        });
+      });
+
+      test('34: recovery emits on the FIRST healthy probe, never delayed', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks();
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.internetDisconnected]);
+
+          h.setStatus(200);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [
+              ConnectionHealthState.internetDisconnected,
+              ConnectionHealthState.healthy,
+            ],
+            reason: 'slow to alarm, fast to reassure',
+          );
+          h.monitor.dispose();
+        });
+      });
+
+      test('35: weakNetwork is confirmed on the same rule', () {
+        fakeAsync((async) {
+          final emissions = <ConnectionHealthState>[];
+          final monitor = _build(
+            httpClient: MockClient((_) async {
+              await Future<void>.delayed(const Duration(seconds: 4));
+              return http.Response('ok', 200);
+            }),
+            internetChecker: _FakeInternetConnection(online: true),
+            slowThreshold: const Duration(seconds: 3),
+            downConfirmationCount: 2,
+            retryInterval: const Duration(seconds: 30),
+          );
+          monitor.stream.listen(emissions.add);
+          monitor.start();
+
+          async.elapse(const Duration(seconds: 5));
+          async.flushMicrotasks();
+          expect(emissions, isEmpty, reason: 'one slow response is not proof');
+
+          async.elapse(const Duration(seconds: 35));
+          async.flushMicrotasks();
+          expect(emissions, [ConnectionHealthState.weakNetwork]);
+          monitor.dispose();
+        });
+      });
+
+      test('36: currentState never reports an unconfirmed state', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks();
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.monitor.currentState,
+              ConnectionHealthState.internetDisconnected);
+
+          // One serverUnreachable — unconfirmed, so the reported state must
+          // not move. A late subscriber is replayed currentState, and must
+          // never receive a value the stream itself never emitted.
+          h.setOnline(online: true);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(
+            h.monitor.currentState,
+            ConnectionHealthState.internetDisconnected,
+            reason: 'currentState must stay consistent with the stream',
+          );
+
+          final late = <ConnectionHealthState>[];
+          h.monitor.stream.listen(late.add);
+          async.flushMicrotasks();
+          expect(late, [ConnectionHealthState.internetDisconnected]);
+          h.monitor.dispose();
+        });
+      });
+
+      test('37: an unconfirmed bad probe retries on the FAST cadence', () {
+        fakeAsync((async) {
+          final h = harness(
+            retryInterval: const Duration(minutes: 1),
+            healthyInterval: const Duration(minutes: 5),
+          );
+          h.monitor.start();
+          async.flushMicrotasks();
+          expect(h.hits(), 1);
+
+          // Scheduling keys off the RAW probe result, not the confirmed
+          // one, so confirmation arrives a retryInterval later rather than
+          // waiting out healthyInterval.
+          async.elapse(const Duration(minutes: 1, seconds: 1));
+          async.flushMicrotasks();
+          expect(h.hits(), 2);
+          expect(h.emissions, [ConnectionHealthState.internetDisconnected]);
+          h.monitor.dispose();
+        });
+      });
+
+      test('38: downConfirmationCount below 1 asserts', () {
+        expect(
+          () => ConnectionHealthMonitor(
+            baseUrl: 'https://api.example.com',
+            downConfirmationCount: 0,
+          ),
+          throwsA(isA<AssertionError>()),
+          reason: '0 would mean a state is never confirmed',
+        );
+      });
     });
   });
 }

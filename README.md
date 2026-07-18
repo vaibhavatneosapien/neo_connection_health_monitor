@@ -129,7 +129,7 @@ The five states are intentional. UI needs to distinguish "fix your WiFi" (user c
 
 | Symbol | Summary |
 |---|---|
-| `stream` | Broadcast `Stream<ConnectionHealthState>`. De-duplicated; emits only on real state changes. |
+| `stream` | Broadcast `Stream<ConnectionHealthState>`. De-duplicated; emits only on real state changes. Degraded states are gated by `downConfirmationCount` — see below. |
 | `currentState` | Synchronous read of the last observed state. Returns `initial` before the first check completes — see warning below. |
 | `start()` | Begins (or resumes) the polling loop. The first check fires immediately. Idempotent. |
 | `stop()` | Pause. Cancels the pending timer and clears the running flag; leaves the stream controller open so a later `start()` resumes cleanly. |
@@ -141,6 +141,29 @@ Notes:
 - **`stop()` vs `dispose()` — pause vs terminal.** `stop()` is the recommended call when the app is backgrounded (`AppLifecycleState.paused` / `detached` / `hidden` — NOT `inactive`, a transient iOS foreground state); the monitor can be resumed with `start()`. `dispose()` is the call at app shutdown; the monitor cannot be reused afterwards.
 - **`checkNow()` does NOT emit on the stream.** It is a pure probe — use the returned `Future<ConnectionHealthState>` to drive a button spinner or toast locally. Consumers that expect a stream emission will get silent breakage; subscribe to `stream` for emissions, await `checkNow()` for the return value.
 - **`currentState` returns `initial` before the first check.** Do not render UI from a synchronous read of `currentState` immediately after construction — subscribe to `stream` and react to the first emitted event instead.
+- **`checkNow()` does not participate in `downConfirmationCount`.** It is a pure probe and reports what it saw, unconfirmed. The confirmation streak is only advanced by the scheduled polling loop.
+
+### Avoiding false alarms — `downConfirmationCount`
+
+By default the monitor reports a degraded state on the **first** probe that observes it. A single blip — a lift, a tunnel, one overloaded response — is enough to put an error state in front of the user.
+
+Pass `downConfirmationCount: 2` (or more) to require that many **consecutive, identical** degraded observations before the state is emitted:
+
+```dart
+ConnectionHealthMonitor(
+  baseUrl: '…',
+  healthPath: '/healthz',
+  downConfirmationCount: 2, // one blip no longer alarms
+);
+```
+
+Three properties worth knowing:
+
+- **Recovery is never delayed.** `healthy` is emitted on the first healthy probe and clears the streak. The asymmetry is deliberate — and note it is the *inverse* of the circuit-breaker convention (fast-fail, slow-recover), because a breaker exists to shield a fragile downstream from a retry storm, which is not what a single polling client is doing.
+- **The streak is keyed on the specific state, not on "something was wrong."** `internetDisconnected` followed by `serverUnreachable` confirms neither and restarts the count. Two different failures are not yet a consistent story, and a generic counter would announce a state it had only observed once.
+- **Confirmation arrives on the fast cadence.** An unconfirmed degraded probe still reschedules at `retryInterval`, not `healthyInterval`, so the follow-up check is a minute away rather than five.
+
+The default of `1` is exactly the historical behaviour, so existing consumers are unaffected until they opt in.
 
 ## Why a pure-Dart package?
 

@@ -55,6 +55,15 @@ class ConnectionHealthMonitor {
   ///   `< requestTimeout` (asserted): at or above the timeout the probe
   ///   is aborted before it could ever be judged slow, leaving
   ///   `weakNetwork` unreachable.
+  /// - [downConfirmationCount] - how many consecutive probes must report
+  ///   the SAME degraded state before it is emitted. Default `1`
+  ///   (emit on first observation - the historical behaviour, so
+  ///   existing consumers are unaffected). Must be `>= 1` (asserted).
+  ///   Set `2`+ to stop a single blip - a lift, a tunnel, one overloaded
+  ///   response - from putting an error state in front of the user.
+  ///   Recovery to `healthy` is never delayed by this. See
+  ///   [_isConfirmed] for why the run is keyed on the specific state
+  ///   rather than on "something was wrong".
   /// - [jitterRatio] - +/- random jitter fraction on each delay.
   ///   Default: 0.1 (+/-10%); pass `0.0` to disable. See the field for
   ///   the `[0, 1)` bound.
@@ -77,6 +86,7 @@ class ConnectionHealthMonitor {
     this.retryInterval = const Duration(minutes: 1),
     this.requestTimeout = const Duration(seconds: 8),
     this.slowThreshold = const Duration(seconds: 3),
+    this.downConfirmationCount = 1,
     this.jitterRatio = 0.1,
     http.Client? httpClient,
     InternetConnection? internetChecker,
@@ -88,6 +98,10 @@ class ConnectionHealthMonitor {
         assert(
           slowThreshold > Duration.zero && slowThreshold < requestTimeout,
           'slowThreshold must be in (0, requestTimeout)',
+        ),
+        assert(
+          downConfirmationCount >= 1,
+          'downConfirmationCount must be >= 1',
         ),
         _ownsClient = httpClient == null,
         _ownsChecker = internetChecker == null,
@@ -114,6 +128,11 @@ class ConnectionHealthMonitor {
   /// Round-trip duration above which a SUCCESSFUL probe reports
   /// [ConnectionHealthState.weakNetwork] instead of `healthy`.
   final Duration slowThreshold;
+
+  /// Consecutive identical degraded observations required before that
+  /// state is emitted. `1` (default) preserves the historical
+  /// emit-on-first-observation behaviour.
+  final int downConfirmationCount;
 
   /// Fraction of the scheduled delay applied as +/- random jitter.
   /// `0.1` means +/-10%. Must be in `[0, 1)` (asserted at construction):
@@ -183,6 +202,15 @@ class ConnectionHealthMonitor {
   /// Last state emitted on [stream]; the de-dupe baseline (see
   /// [_emitIfChanged]).
   ConnectionHealthState _lastState = ConnectionHealthState.initial;
+
+  /// The degraded state currently being counted toward
+  /// [downConfirmationCount], or `null` when the last observation was
+  /// `healthy`. Keyed on the state itself so a switch between two
+  /// different failures restarts the run — see [_isConfirmed].
+  ConnectionHealthState? _streakState;
+
+  /// How many consecutive times [_streakState] has been observed.
+  int _streakCount = 0;
 
   // ---------------------------------------------------------------------------
   // Public API.
@@ -435,11 +463,46 @@ class ConnectionHealthMonitor {
   /// state differs from the last emission. `initial` is a valid
   /// previous-state baseline so the first non-`initial` observation
   /// emits exactly one event.
+  ///
+  /// A degraded [state] must first clear [_isConfirmed]; until it does,
+  /// this returns without touching [_currentState] or [_lastState], so an
+  /// unconfirmed observation is invisible to BOTH the stream and
+  /// [currentState] (a late subscriber is replayed [_currentState], and
+  /// must never receive a value the stream itself never emitted).
   void _emitIfChanged(ConnectionHealthState state) {
+    if (!_isConfirmed(state)) return;
     _currentState = state;
     if (state == _lastState) return;
     _lastState = state;
     if (!_controller.isClosed) _controller.add(state);
+  }
+
+  /// Consecutive-observation gate: `true` once [state] may be reported.
+  ///
+  /// `healthy` always passes immediately and clears the streak — recovery
+  /// is never delayed (the inverse of the circuit-breaker convention,
+  /// deliberately: a breaker trips fast to shield a fragile downstream
+  /// from a retry storm, which is not what one polling client is doing).
+  ///
+  /// A degraded state must be observed [downConfirmationCount] times in a
+  /// row, and the run is keyed on the state ITSELF, not on
+  /// "something was wrong". `internetDisconnected` then `serverUnreachable`
+  /// restarts the count rather than confirming either — two different
+  /// failures are not yet a consistent story, and a generic counter would
+  /// announce a state it had only actually observed once.
+  bool _isConfirmed(ConnectionHealthState state) {
+    if (state == ConnectionHealthState.healthy) {
+      _streakState = null;
+      _streakCount = 0;
+      return true;
+    }
+    if (state == _streakState) {
+      _streakCount++;
+    } else {
+      _streakState = state;
+      _streakCount = 1;
+    }
+    return _streakCount >= downConfirmationCount;
   }
 
   /// Next delay: `healthyInterval` if [state] is `healthy`, else
