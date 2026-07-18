@@ -1,18 +1,7 @@
-// Full behavioral test suite for `ConnectionHealthMonitor`. Covers all
-// 14 cases required by `CLAUDE.md` §Testing plus supplementary cases
-// added during code review (7b, 14b, 15, 15b, 16, 17, 18, 19) and the
-// post-review mend pass (20 timeout+offline, 21 dispose-in-flight,
-// 22 checkNow-before-start, 23 late-subscriber de-dupe, 24 jitter assert,
-// 25 injected-checker not disposed).
-//
-// Uses:
-//   - `package:http/testing.dart` `MockClient` to fake the server probe.
-//   - A `_FakeInternetConnection` subclass to control the internet probe.
-//   - `package:fake_async` to drive timer-based scheduling deterministically.
-//   - A seeded `Random` for predictable jitter.
-//
-// Every test injects all dependencies — no test hits the real network or
-// the real wall clock.
+// Behavioral suite for `ConnectionHealthMonitor`: states, lifecycle,
+// jitter, and URL normalization. Injects `MockClient`, a
+// `_FakeInternetConnection`, and a seeded `Random` under `fake_async` — no
+// test touches the real network or wall clock.
 
 import 'dart:async';
 import 'dart:math';
@@ -874,23 +863,19 @@ void main() {
         async.flushMicrotasks();
         expect(existing, [ConnectionHealthState.healthy]);
 
-        // Silent checkNow moves currentState → serverUnreachable without
-        // emitting; _lastState (de-dupe baseline) stays healthy.
+        // Silent checkNow moves currentState ahead of _lastState.
         statusCode = 500;
         monitor.checkNow();
         async.flushMicrotasks();
         expect(monitor.currentState, ConnectionHealthState.serverUnreachable);
         expect(existing, [ConnectionHealthState.healthy]);
 
-        // Late subscriber mounts on the divergence and replays the fresh
-        // currentState once.
         final late = <ConnectionHealthState>[];
         monitor.stream.listen(late.add);
         async.flushMicrotasks();
         expect(late, [ConnectionHealthState.serverUnreachable]);
 
-        // Next loop tick (retryInterval) re-observes serverUnreachable and
-        // broadcasts it to all subscribers.
+        // Next tick re-broadcasts serverUnreachable to all subscribers.
         async.elapse(const Duration(seconds: 6));
         async.flushMicrotasks();
         expect(existing, [

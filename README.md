@@ -26,7 +26,10 @@ dependencies:
 ## Quick start
 
 ```dart
-final monitor = ConnectionHealthMonitor(baseUrl: 'https://api.neosapien.xyz');
+final monitor = ConnectionHealthMonitor(
+  baseUrl: 'https://neo-backend-v2.dev-api.neosapien.xyz',
+  healthPath: '/healthz',
+);
 monitor.start();
 
 monitor.stream.listen((state) {
@@ -48,6 +51,21 @@ monitor.start();  // on resume
 // On app shutdown:
 await monitor.dispose();
 ```
+
+## Endpoint configuration (Neosapien)
+
+`healthPath` defaults to `/health` — the conventional default for a reusable package. **The Neosapien backend serves `/healthz`**, so the consumer app must pass `healthPath: '/healthz'`. There is no `/health` route on any environment; leaving the default in place yields a permanent `serverUnreachable`.
+
+Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
+
+| Env | `baseUrl` | Status (probed 2026-07-16) |
+|---|---|---|
+| dev | `https://neo-backend-v2.dev-api.neosapien.xyz` | Live — `200 {"status":"ok"}` |
+| prod | `https://neo-backend-v2.api.neosapien.xyz` | Route not deployed yet |
+
+`https://api.neosapien.xyz` is the bare gateway, **not** neo-backend-v2 — it 404s on `/healthz`. Don't point the monitor at it.
+
+The endpoint is a **liveness** check: it returns a static `{"status": "ok"}` and touches no datastore. That is deliberate ([why](docs/solutions/architecture-patterns/health-endpoint-liveness-vs-readiness.md)), and it means `healthy` proves the backend is *reachable*, not that every dependency behind it is well.
 
 ## Caller responsibility — backgrounding (REQUIRED)
 
@@ -86,7 +104,7 @@ class _AppLifecycleWatcher with WidgetsBindingObserver {
 }
 
 // In main() / top-level widget initState:
-final monitor = ConnectionHealthMonitor(baseUrl: '…');
+final monitor = ConnectionHealthMonitor(baseUrl: '…', healthPath: '…');
 final watcher = _AppLifecycleWatcher(monitor);
 WidgetsBinding.instance.addObserver(watcher);
 monitor.start();
@@ -97,7 +115,7 @@ monitor.start();
 | State | Meaning | Recommended UI affordance |
 |---|---|---|
 | `initial` | First check has not completed yet. | Show nothing (loading). |
-| `healthy` | Server `/health` returned 2xx. | Hide banner. |
+| `healthy` | The configured health endpoint returned 2xx. | Hide banner. |
 | `internetDisconnected` | Server unreachable AND the generic internet probe also failed. | "Check your WiFi / mobile data". |
 | `serverUnreachable` | Server failed but the generic internet probe succeeded. | "Our servers are temporarily unreachable". |
 

@@ -4,9 +4,13 @@ import 'package:neo_connection_health/neo_connection_health.dart';
 /// 30 seconds, then dispose cleanly.
 ///
 /// Replace `baseUrl` with your own API base; this example points at the
-/// Neosapien production API by default.
+/// Neosapien dev API, whose health route is `/healthz` (the package
+/// default `/health` does not exist on any Neosapien environment).
 Future<void> main() async {
-  final monitor = ConnectionHealthMonitor(baseUrl: 'https://api.neosapien.xyz');
+  final monitor = ConnectionHealthMonitor(
+    baseUrl: 'https://neo-backend-v2.dev-api.neosapien.xyz',
+    healthPath: '/healthz',
+  );
 
   final sub = monitor.stream.listen((state) {
     // ignore: avoid_print

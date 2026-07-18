@@ -17,12 +17,27 @@ tags: [health-endpoint, liveness, readiness, connectivity-monitor, fastapi, flee
 
 ## Context
 
-`neo_connection_health` polls `GET {baseUrl}/health` from every
+`neo_connection_health` polls `GET {baseUrl}/healthz` from every
 Neosapien device on an adaptive timer (5 min healthy, 1 min retry). Any
 non-2xx response is classified as `serverUnreachable` and drives a
-user-facing banner ("Our servers are down"). The backend `/health` route
-did not exist yet — `https://api.neosapien.xyz/health` returned 404 — so
-the question arose: what should the endpoint actually do when we build it?
+user-facing banner ("Our servers are down"). When this was written the
+backend route did not exist yet, so the question arose: what should the
+endpoint actually do when we build it?
+
+**Outcome (2026-07-16): built as recommended.** The backend shipped
+`/healthz` (not `/health`) in `neo-backend-v2/main.py:245`, and it is a
+liveness check exactly as argued below:
+
+```python
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok"}
+```
+
+Verified live on dev (`https://neo-backend-v2.dev-api.neosapien.xyz/healthz`
+→ `200 {"status":"ok"}`, ~240 ms, no dependency touched). The guidance
+below is therefore settled, not speculative — treat a future PR that adds
+Mongo/Redis pings to this route as a regression.
 
 Two candidate implementations, and they are NOT interchangeable:
 
@@ -36,15 +51,15 @@ works." For a fleet-polled, banner-driving endpoint that instinct is wrong.
 
 ## Guidance
 
-**Make the client-facing `/health` a liveness check.** A live process
+**Make the client-facing health route a liveness check.** A live process
 answering 200 is exactly the signal the monitor needs — "can I reach our
 server right now?"
 
 ```python
-# FastAPI — drop next to the existing "/" route in main.py
-@app.get("/health", include_in_schema=False)
-async def health():
-    return {"status": "ok", "env": ENV, "timestamp": int(time.time() * 1000)}
+# FastAPI — what neo-backend-v2 actually ships (main.py:245)
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok"}
 ```
 
 FastAPI returns 200 by default → the package reads 2xx → `healthy`. No
@@ -90,8 +105,8 @@ dependency-aware one.
 
 ```python
 # Anti-pattern for a client-fleet endpoint: flaps + amplifies DB load.
-@app.get("/health", include_in_schema=False)
-async def health():
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
     checks, ok = {}, True
     try:
         await r.ping()                                    # Redis
@@ -117,17 +132,31 @@ banner honest (still "reachable") without flapping the whole thing to
 "down":
 
 ```python
-@app.get("/health", include_in_schema=False)
-async def health():
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
     return {"status": "degraded", "env": ENV, "timestamp": int(time.time() * 1000)}
     # still 2xx → package stays `healthy`; a future client parses status
 ```
 
+## The accepted trade-off
+
+Liveness is the right call here, but it is not free, and the cost should be
+named rather than discovered during an incident: **backend process up +
+database down → `/healthz` still returns 200 → the package emits `healthy`
+→ no banner, while the app is in fact broken.** That is the deliberate
+price of a stable, cheap, non-amplifying signal. The fix is *not* to flip
+this route to readiness (that reintroduces both failure modes above) — it
+is the future `degraded` state, which returns **200 with a degraded body**
+per the snippet above.
+
 ## Related
 
-- `CLAUDE.md` §Tech — mandates `GET` over `HEAD` (avoids 405 on GET-only
-  routes; lets the body carry a future degraded payload).
+- `CLAUDE.md` §Tech — mandates `GET` over `HEAD`. Now confirmed live:
+  `HEAD /healthz` returns `405` because the route is declared `@app.get`.
+- `CLAUDE.md` §Project → Backend endpoint — verified hosts, per-env deploy
+  status, and the `healthPath: '/healthz'` override consumers must pass.
 - `lib/src/connection_health_monitor.dart` — `_runCheck` server-first probe
   that classifies any non-2xx as `serverUnreachable`.
-- Backend `../neo-backend-v2/main.py` — target file for the liveness route
-  (still unimplemented as of this writing; `/health` returns 404).
+- Backend `../neo-backend-v2/main.py:245` — the shipped liveness route.
+  Rate-limit exempt (`core/api_rate_limit.py:105`) and filtered out of
+  access logs (`main.py:117`), both of which matter at fleet polling rates.

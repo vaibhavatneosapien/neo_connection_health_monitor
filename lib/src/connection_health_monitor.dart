@@ -29,36 +29,28 @@ import 'connection_health_state.dart';
 /// HTTP traffic.
 ///
 /// A copy-paste `WidgetsBindingObserver` snippet lives in the README.
-///
-/// ## Lifecycle summary
-///
-/// - [start] - begins polling; idempotent.
-/// - [stop] - pause; cancels the pending timer, leaves the stream
-///   controller open. Calling [start] afterwards resumes polling.
-/// - [dispose] - terminal; cancels the timer, closes the broadcast
-///   controller, and closes the [http.Client] if (and only if) the
-///   package created it. Any subsequent method call throws
-///   [StateError].
-/// - [checkNow] - pure probe; returns the freshly-observed state, does
-///   NOT emit on [stream], resets the scheduled timer.
 class ConnectionHealthMonitor {
   /// Creates a monitor that probes `${baseUrl}${healthPath}` on an
   /// adaptive schedule and reports state transitions on [stream].
   ///
   /// - [baseUrl] - required. The API base URL, e.g.
-  ///   `https://api.neosapien.xyz`. Any trailing `/` is stripped at
-  ///   construction time.
+  ///   `https://neo-backend-v2.dev-api.neosapien.xyz`. Any trailing `/`
+  ///   is stripped at construction time.
   /// - [healthPath] - defaults to `/health`. A leading `/` is added if
-  ///   missing.
+  ///   missing. **Neosapien consumers must pass `/healthz`** - the
+  ///   backend serves `/healthz` and has no `/health` route on any
+  ///   environment, so the default would yield a permanent
+  ///   `serverUnreachable`. The default stays `/health` because it is
+  ///   the conventional choice for a reusable package.
   /// - [healthyInterval] - delay between checks after a `healthy`
   ///   observation. Default: 5 minutes.
   /// - [retryInterval] - delay between checks after any non-`healthy`
   ///   observation. Default: 1 minute.
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
   ///   (chosen over 5 s for 3G on tier-2 networks).
-  /// - [jitterRatio] - fraction of the scheduled delay applied as
-  ///   +/- random jitter. Default: 0.1 (+/-10%). Pass exactly `0.0` to
-  ///   disable jitter (the check is `jitterRatio == 0`, no epsilon).
+  /// - [jitterRatio] - +/- random jitter fraction on each delay.
+  ///   Default: 0.1 (+/-10%); pass `0.0` to disable. See the field for
+  ///   the `[0, 1)` bound.
   /// - [httpClient] - optional injected client. If `null`, the monitor
   ///   creates its own [http.Client] and closes it on [dispose]. An
   ///   injected client is never closed by the monitor.
@@ -83,8 +75,7 @@ class ConnectionHealthMonitor {
     Random? random,
   })  : assert(
           jitterRatio >= 0 && jitterRatio < 1,
-          'jitterRatio must be in [0, 1); a value >= 1 lets negative jitter '
-          'clamp the delay to 0, producing back-to-back probe bursts.',
+          'jitterRatio must be in [0, 1)',
         ),
         _ownsClient = httpClient == null,
         _ownsChecker = internetChecker == null,
@@ -118,15 +109,12 @@ class ConnectionHealthMonitor {
   // Private state.
   // ---------------------------------------------------------------------------
 
-  /// `true` if the monitor created [_httpClient] itself and is therefore
-  /// responsible for closing it on [dispose]. An injected client is
-  /// owned by the caller and must never be closed here.
+  /// `true` if the monitor created [_httpClient] itself, so [dispose]
+  /// closes it. An injected client is the caller's to close.
   final bool _ownsClient;
 
-  /// `true` if the monitor created [_internetChecker] itself (via
-  /// `createInstance()`) and must therefore dispose it on [dispose] to
-  /// free its internal timers/controllers. An injected checker is owned
-  /// by the caller and must never be disposed here.
+  /// `true` if the monitor created [_internetChecker] itself, so [dispose]
+  /// disposes it. An injected checker is the caller's to dispose.
   final bool _ownsChecker;
 
   /// Pre-composed request URI. Built once at construction time so the
@@ -142,8 +130,7 @@ class ConnectionHealthMonitor {
   /// Google) - see `internet_connection_checker_plus` docs.
   final InternetConnection _internetChecker;
 
-  /// Source of randomness for +/- jitter on scheduled delays. Inject a
-  /// seeded `Random` in tests for deterministic timing.
+  /// Source of jitter randomness (seeded in tests).
   final Random _random;
 
   /// Broadcast controller for state transitions. Multiple subscribers
@@ -177,10 +164,8 @@ class ConnectionHealthMonitor {
   /// the de-dupe baseline; starts as [ConnectionHealthState.initial].
   ConnectionHealthState _currentState = ConnectionHealthState.initial;
 
-  /// Last state actually emitted on [stream]. Used to de-dupe so that
-  /// repeated `healthy -> healthy` observations do not cause needless
-  /// `StreamBuilder` rebuilds. Initialized to `initial` so the first
-  /// real check produces exactly one emission.
+  /// Last state emitted on [stream]; the de-dupe baseline (see
+  /// [_emitIfChanged]).
   ConnectionHealthState _lastState = ConnectionHealthState.initial;
 
   // ---------------------------------------------------------------------------
@@ -260,25 +245,19 @@ class ConnectionHealthMonitor {
     _throwIfDisposed();
     if (_running) return;
     _running = true;
-    // Bump generation so any stale in-flight loop iteration from a prior
-    // start()/stop() cycle bails on its post-await guard instead of
-    // emitting and rescheduling — preventing concurrent loops doubling
-    // the request rate.
+    // Invalidate any stale in-flight _loop from a prior start()/stop()
+    // cycle (see [_generation]).
     final gen = ++_generation;
-    // Fire-and-forget: the loop self-schedules via Timer.
-    unawaited(_loop(gen));
+    unawaited(_loop(gen)); // fire-and-forget; the loop self-schedules
   }
 
   /// Pauses the polling loop without tearing down the monitor.
   ///
-  /// Cancels the pending timer and clears the running flag. The
-  /// broadcast [stream] controller stays open, and any owned
-  /// [http.Client] is NOT closed - so a subsequent [start] resumes
-  /// polling cleanly. This is the right call when the app is backgrounded
-  /// (`AppLifecycleState.paused` / `detached` / `hidden`) - NOT on
-  /// `inactive`, which is a transient foreground state on iOS.
-  ///
-  /// For terminal cleanup at app shutdown, use [dispose] instead.
+  /// Cancels the pending timer and clears the running flag; the [stream]
+  /// controller stays open and an owned [http.Client] is NOT closed, so a
+  /// subsequent [start] resumes cleanly. Call this when the app is
+  /// backgrounded — not on `inactive` (see the class docs for the
+  /// backgrounding contract). For shutdown, use [dispose].
   void stop() {
     _throwIfDisposed();
     _running = false;
@@ -334,10 +313,9 @@ class ConnectionHealthMonitor {
     _throwIfDisposed();
     _pendingTimer?.cancel();
     _pendingTimer = null;
-    // Bump generation to invalidate any concurrent in-flight `_loop`
-    // iteration. Without this, a `_loop._runCheck()` that started before
-    // `checkNow` and completes after would overwrite the timer we schedule
-    // below — resetting the schedule from the wrong point in time.
+    // Invalidate any concurrent in-flight _loop (see [_generation]): else a
+    // _runCheck that completes after this checkNow would overwrite the
+    // timer scheduled below, resetting the schedule from the wrong point.
     final gen = ++_generation;
     final state = await _runCheck();
     if (_disposed) return state;
@@ -355,10 +333,9 @@ class ConnectionHealthMonitor {
   // ---------------------------------------------------------------------------
 
   /// One adaptive iteration: run the dual-tier check, emit on change,
-  /// schedule the next iteration. Bails without emitting or scheduling
-  /// if [stop] or [dispose] fired while the check was in flight, or if
-  /// a fresh [start] cycle bumped [_generation] past [gen] (which means
-  /// a newer loop is already in flight).
+  /// schedule the next. Bails without emitting or rescheduling if [stop]/
+  /// [dispose] fired mid-check or a newer [start] cycle superseded [gen]
+  /// (see [_generation]).
   Future<void> _loop(int gen) async {
     if (!_running || _disposed || gen != _generation) return;
     final state = await _runCheck();
@@ -387,19 +364,16 @@ class ConnectionHealthMonitor {
       // hang the loop past `requestTimeout`.
       serverOk = await _probeServer().timeout(requestTimeout);
     } on TimeoutException {
-      // Falls through to the disambiguation block below.
+      // fall through to disambiguation
     } on http.ClientException {
-      // Falls through (covers `Client.send` errors after `close`; the
-      // IOClient also wraps `dart:io` `SocketException` as this type).
+      // Client.send() throws this after close(); IOClient also wraps
+      // SocketException as this type. Fall through.
     } on Exception {
-      // Any other transport-layer failure (HandshakeException, a raw
-      // SocketException, etc). This generic clause is the real backstop —
-      // it is why no `dart:io`-specific catch is needed, which in turn
-      // keeps this file free of a `dart:io` import so the package stays
-      // Web/WASM-capable. We deliberately do NOT catch `Error` — programmer
-      // bugs (StateError, AssertionError, type errors) must propagate so
-      // they surface in development instead of being silently classified as
-      // `serverUnreachable`.
+      // Any other transport failure (HandshakeException, raw SocketException).
+      // This generic clause is the backstop — it's why no `dart:io` catch is
+      // needed, keeping the file import-free of `dart:io` for Web/WASM. Do
+      // NOT catch `Error`: programmer bugs (StateError, type errors) must
+      // propagate, not be misclassified as `serverUnreachable`.
     }
 
     if (serverOk) return ConnectionHealthState.healthy;
@@ -416,18 +390,14 @@ class ConnectionHealthMonitor {
         : ConnectionHealthState.internetDisconnected;
   }
 
-  /// Issues the `GET _uri` request and reports whether the server
-  /// responded with 2xx. Wrapped in `requestTimeout` by the caller.
-  ///
+  /// Issues `GET _uri` (redirects disabled) and reports whether the
+  /// server responded 2xx. Wrapped in `requestTimeout` by the caller.
   /// Drains the body so the pooled connection is reusable (a future
-  /// `degraded` state would parse the 2xx body here instead of discarding
-  /// it). Caveat: `Future.timeout` does not cancel its source, so a hung
-  /// body keeps the `drain()` subscription alive until the transport's own
-  /// idle timeout reclaims it. Self-limiting in practice — a health body is
-  /// a few bytes and LB/proxy idle timeouts (~60s) sit under the retry
-  /// cadence — so it's a caveat, not a live leak.
-  // ponytail: drain-on-timeout not cancelled; upgrade to a cancelable
-  // subscription if a real slow-body leak ever shows up in metrics.
+  /// `degraded` state would parse it here instead).
+  // ponytail: drain isn't cancelled on timeout; a hung body keeps the
+  // subscription alive until the transport's idle timeout (~60s, under the
+  // retry cadence) reclaims it — self-limiting, not a leak. Upgrade to a
+  // cancelable drain if metrics ever show a real slow-body leak.
   Future<bool> _probeServer() async {
     final req = http.Request('GET', _uri)..followRedirects = false;
     final res = await _httpClient.send(req);
@@ -447,10 +417,8 @@ class ConnectionHealthMonitor {
     if (!_controller.isClosed) _controller.add(state);
   }
 
-  /// Computes the next scheduled delay: `healthyInterval` when the
-  /// last observed state was `healthy`, else `retryInterval`, with
-  /// `±jitterRatio` random jitter applied uniformly. Inject a seeded
-  /// [Random] in tests for deterministic timing.
+  /// Next delay: `healthyInterval` if [state] is `healthy`, else
+  /// `retryInterval`, with uniform `±jitterRatio` jitter.
   Duration _nextDelay(ConnectionHealthState state) {
     final base = state == ConnectionHealthState.healthy
         ? healthyInterval
@@ -506,8 +474,5 @@ class ConnectionHealthMonitor {
   }
 }
 
-/// Matches one or more trailing `/` characters.
 final RegExp _trailingSlashes = RegExp(r'/+$');
-
-/// Matches one or more leading `/` characters.
 final RegExp _leadingSlashes = RegExp(r'^/+');

@@ -8,13 +8,45 @@ Guidance for Claude Code when working in this repository.
 
 **`neo_connection_health`** — pure Dart package that monitors device internet connectivity AND a specific server's reachability, exposing real-time state via a `Stream`.
 
-Consumer is a Flutter app (Neosapien). The app passes its API base URL (e.g. `https://api.neosapien.xyz`) into the package; the package pings a `/health` route on that base URL on an adaptive schedule and streams state transitions back to the UI.
+Consumer is a Flutter app (Neosapien). The app passes its API base URL (e.g. `https://neo-backend-v2.dev-api.neosapien.xyz`) into the package; the package pings the health route on that base URL on an adaptive schedule and streams state transitions back to the UI.
 
 ```
-App ──(baseUrl + /health)──▶ Package ──(5 min healthy / 1 min retry, ±10% jitter)──▶ Server /health
-                                │
-                                └──(Stream<ConnectionHealthState>)──▶ UI (StreamBuilder)
+App ──(baseUrl + /healthz)──▶ Package ──(5 min healthy / 1 min retry, ±10% jitter)──▶ Server /healthz
+                                 │
+                                 └──(Stream<ConnectionHealthState>)──▶ UI (StreamBuilder)
 ```
+
+### Backend endpoint — verified live 2026-07-16
+
+The real Neosapien route is **`/healthz`**, not the package default `/health`. `neo-backend-v2/main.py:245`:
+
+```python
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    return {"status": "ok"}
+```
+
+Consumers MUST pass `healthPath: '/healthz'`. The package default stays `/health` — it is the conventional generic default for a reusable package, and the override is one line at the construction site. **Do not "fix" this by changing the default** unless Neosapien is confirmed the only consumer forever.
+
+Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
+
+| Env | Base URL | `/healthz` (probed 2026-07-16) |
+|---|---|---|
+| dev | `https://neo-backend-v2.dev-api.neosapien.xyz` | **200** `{"status":"ok"}` |
+| prod | `https://neo-backend-v2.api.neosapien.xyz` | 404 — not yet deployed (see below) |
+
+`https://api.neosapien.xyz` is the **bare gateway host, not neo-backend-v2** (`neo-backend-v2/auth/principal_resolver.py:17`). It answers `200` on `/` but `404` on `/healthz`. Earlier revisions of this document used it as the example base URL; that was wrong. Do not reintroduce it.
+
+**Prod is not live yet.** Commit `2ae0314a feat: add /healthz endpoint` sits on `origin/dev` only. `neo-backend-v2/.github/workflows/deploy.yaml:67-69` maps `main`→prod, `stg`→stg, `dev`→dev, so the route needs promoting `dev` → `stg` → `main` before the package can point at prod. Until then, a prod-configured monitor reports a permanent `serverUnreachable`.
+
+**What the live dev route confirms:**
+
+- **`HEAD /healthz` → `405`.** Direct live proof of the §Tech `GET`-not-`HEAD` mandate: the route is declared `@app.get`, so a `HEAD` probe would report `serverUnreachable` against a perfectly healthy server. This is no longer a hypothetical.
+- **No redirects, 0 hops** on the happy path — `followRedirects = false` (§4) stays quiet.
+- **Cloudflare is in front** (`server: cloudflare`, HTTP/2). §4's "Cloudflare bot challenge / 3xx" rationale describes a real proxy in the path, not a what-if.
+- **`cf-cache-status: DYNAMIC`** — uncached, which is required. A CDN-cached health response is worse than none: it reports a stale `healthy` while the server is down. Re-verify this if anyone adds cache rules for `*.neosapien.xyz`.
+- **~240 ms latency** — the 8 s default `requestTimeout` has ample headroom.
+- **`{"status": "ok"}` is a static literal** — liveness, not readiness; it touches no datastore. This is what we want (see `docs/solutions/architecture-patterns/health-endpoint-liveness-vs-readiness.md`), with one known consequence: backend up + database down still returns 200 → package emits `healthy` → no banner while the app is broken. Covering that is the future `degraded` state (§Out of scope), which needs a real dependency-check body.
 
 ## Tech
 
@@ -29,7 +61,9 @@ App ──(baseUrl + /health)──▶ Package ──(5 min healthy / 1 min retr
 | `http` | Lightweight server health request. Use **`GET`** (see below). | Use `http.Client` so it can be injected for tests. |
 | `internet_connection_checker_plus` | HTTP-level check that device actually has internet (not just WiFi attached to a captive portal). | **Required** over the original `internet_connection_checker` — the original pulls `flutter` + `connectivity_plus` as deps, which breaks the pure-Dart goal. `_plus` depends only on `http`. Pin `^3.0.0` and read the v3 migration guide before bumping. Override the default endpoint list (`one.one.one.one`, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com`) if corp firewalls block any of them. This kind of dependency archaeology prevents pain later — do not "simplify" back to the original package. |
 
-**HTTP method: `GET`, not `HEAD`.** Many backend frameworks return `405 Method Not Allowed` for `HEAD` on routes declared only as `GET` — silent breakage that the package would currently treat as `serverUnreachable`. `GET` is universally supported and lets us read the response body later (e.g. a future `{"status":"degraded"}` payload that could drive a `degraded` state without an API break). Coordinate with the backend team to confirm `/health` is implemented as `GET` and returns a small JSON body.
+**HTTP method: `GET`, not `HEAD`.** Many backend frameworks return `405 Method Not Allowed` for `HEAD` on routes declared only as `GET` — silent breakage that the package would currently treat as `serverUnreachable`. `GET` is universally supported and lets us read the response body later (e.g. a future `{"status":"degraded"}` payload that could drive a `degraded` state without an API break).
+
+**Confirmed against the real backend 2026-07-16, not just predicted.** `/healthz` is declared `@app.get` and `HEAD https://neo-backend-v2.dev-api.neosapien.xyz/healthz` returns `405` live, while `GET` returns `200 {"status":"ok"}` (15-byte JSON body). Had this package shipped `HEAD`, it would have reported `serverUnreachable` permanently against a healthy server. See §Project → Backend endpoint.
 
 Optional:
 - `rxdart` — provides `BehaviorSubject` (new listeners immediately get the last state). It is **pure Dart** (does not pull Flutter); the only valid argument against adding it is dependency surface area, NOT a "Flutter dependency" claim. Hand-rolling replay-on-subscribe correctly is more code than it looks: must handle `close`, error forwarding, listener add/remove timing, and `onListen`/`onCancel` callbacks for the broadcast controller. Prefer `BehaviorSubject` unless the dependency cost is unacceptable.
@@ -79,7 +113,7 @@ class ConnectionHealthMonitor {
 }
 ```
 
-**URL composition (constructor-time normalization).** A naive concat of `baseUrl: 'https://api.neosapien.xyz/'` (trailing slash) and `healthPath: '/health'` (leading slash) produces `https://api.neosapien.xyz//health`. Some servers tolerate it; some return 404; some misroute. Strip trailing `/` from `baseUrl` and ensure leading `/` on `healthPath` in the constructor, OR validate and throw `ArgumentError` on construction. Pre-compute the final `Uri` once and store it on the instance — do not rebuild per request. Test case #11 covers this.
+**URL composition (constructor-time normalization).** A naive concat of `baseUrl: 'https://neo-backend-v2.dev-api.neosapien.xyz/'` (trailing slash) and `healthPath: '/healthz'` (leading slash) produces `https://neo-backend-v2.dev-api.neosapien.xyz//healthz`. Some servers tolerate it; some return 404; some misroute. Strip trailing `/` from `baseUrl` and ensure leading `/` on `healthPath` in the constructor, OR validate and throw `ArgumentError` on construction. Pre-compute the final `Uri` once and store it on the instance — do not rebuild per request. Test case #11 covers this.
 
 **Warning on `currentState`.** Before the first check completes, `currentState` is `initial`. Consumers MUST NOT render UI from a synchronous read of `currentState` right after construction — that returns `initial` and tells you nothing. Consumers MUST subscribe to the stream and react to the first emitted event. Call this out in dartdoc on the getter so it shows up in IDE autocomplete tooltips.
 
@@ -127,14 +161,14 @@ _runCheck():
   return serverUnreachable
 ```
 
-**Why server-first (NOT internet-check-first).** `internet_connection_checker_plus` probes public CDN endpoints (`one.one.one.one` / Cloudflare, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com` / Google). On corporate firewalls, educational networks, and many Indian tier-2 ISP / corporate networks (which are part of Neosapien's user base), those probe endpoints are blocked while `api.neosapien.xyz` is whitelisted. The previous "internet-check-first" order would produce a false `internetDisconnected` verdict, and the UI would tell the user to "check your WiFi" — wrong message, wrong action, and the user cannot do anything to fix it because the WiFi is fine.
+**Why server-first (NOT internet-check-first).** `internet_connection_checker_plus` probes public CDN endpoints (`one.one.one.one` / Cloudflare, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com` / Google). On corporate firewalls, educational networks, and many Indian tier-2 ISP / corporate networks (which are part of Neosapien's user base), those probe endpoints are blocked while the Neosapien API host is whitelisted. The previous "internet-check-first" order would produce a false `internetDisconnected` verdict, and the UI would tell the user to "check your WiFi" — wrong message, wrong action, and the user cannot do anything to fix it because the WiFi is fine.
 
 The inverted order:
 - Resolves the false-negative correctly: server reachable + CDN-blocked → `healthy`.
 - Is cheaper in the happy path: one request, not two. The internet probe only runs on the rare failure path.
 
 Rules:
-- **Server first.** Use `http.Request` (not `httpClient.get`) so `followRedirects = false` can be set. Treat any 3xx as `serverUnreachable` (handled by the disambiguation block — 3xx is not 2xx, so it falls through). Rationale: if `/health` ends up behind a Cloudflare bot challenge or a 301 to a migrated host (common during domain migrations), the "2xx = healthy" rule would silently break. Better to explicitly fail and let ops notice.
+- **Server first.** Use `http.Request` (not `httpClient.get`) so `followRedirects = false` can be set. Treat any 3xx as `serverUnreachable` (handled by the disambiguation block — 3xx is not 2xx, so it falls through). Rationale: Cloudflare is confirmed in front of the real endpoint (§Project → Backend endpoint), so if `/healthz` ends up behind a bot challenge or a 301 to a migrated host (common during domain migrations), the "2xx = healthy" rule would silently break. Better to explicitly fail and let ops notice.
 - Treat any non-2xx, timeout, or thrown exception from the HTTP call as a failure that triggers the internet-check tiebreaker.
 - Do not retry inside `_runCheck()` — the loop already retries on the 1-minute cadence. Retrying here doubles request rate without improving outcomes.
 - Read and discard the response body to free the connection back to the pool. Do not parse the body in v1 (future `degraded` state will).
@@ -318,7 +352,12 @@ Senior review explicitly endorsed these — do not "simplify" them away in futur
 ## Quick reference — expected consumer usage
 
 ```dart
-final monitor = ConnectionHealthMonitor(baseUrl: 'https://api.neosapien.xyz');
+// healthPath is REQUIRED — the Neosapien route is /healthz, not the
+// package default /health. See §Project → Backend endpoint.
+final monitor = ConnectionHealthMonitor(
+  baseUrl: 'https://neo-backend-v2.dev-api.neosapien.xyz',
+  healthPath: '/healthz',
+);
 monitor.start();
 
 monitor.stream.listen((state) {

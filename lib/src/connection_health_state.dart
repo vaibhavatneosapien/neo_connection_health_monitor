@@ -1,11 +1,9 @@
 /// The four states reported by [ConnectionHealthMonitor].
 ///
-/// These map 1:1 to the affordances a UI should show. They are deliberately
-/// kept distinct so that `internetDisconnected` (user can act — fix WiFi) and
-/// `serverUnreachable` (user is stuck waiting on us) drive different copy.
-///
-/// Do not collapse [internetDisconnected] and [serverUnreachable] into a
-/// single "offline" state — they communicate different things to the user.
+/// Each maps 1:1 to a UI affordance. Keep [internetDisconnected] (user can
+/// act — fix WiFi) and [serverUnreachable] (user is stuck waiting on us)
+/// distinct — do not collapse them into one "offline" state; they drive
+/// different UI copy.
 enum ConnectionHealthState {
   /// The state before the first health check completes. Acts as a
   /// starting sentinel so consumers can distinguish "not yet checked"
