@@ -1,6 +1,9 @@
 name: neo_connection_health
 description: Pure Dart package that monitors device internet connectivity and a specific server's reachability, exposing real-time state via a Stream.
-version: 0.1.0
+# 0.2.0, not 0.1.1: `ConnectionHealthState` gained `weakNetwork`, which
+# breaks any consumer with an exhaustive switch. Under semver's 0.x rules
+# the minor is the breaking slot.
+version: 0.2.0
 # repository: https://github.com/my_org/my_repo
 
 environment:
