@@ -17,7 +17,7 @@ tags: [confirmation-gate, hysteresis, weak-network, never-confirms, downConfirma
 
 ## Status
 
-Unfixed as of 2026-07-19. Present in the uncommitted 0.2.0 work in the tree. Independent of any planned feature — worth fixing on its own.
+**Fixed 2026-07-20** on `feat/weak-network-state`, in the unreleased 0.2.0 section. Both halves shipped, with a third regression guard the original write-up did not anticipate — see Fix below.
 
 ## Symptom
 
@@ -68,15 +68,31 @@ final reportingDegraded = _currentState != ConnectionHealthState.healthy &&
     _currentState != ConnectionHealthState.weakNetwork;
 ```
 
-**2. Reset `_degradedRun` when `weakNetwork` is confirmed.** Without this, half 1 opens a false-confirm path. `_degradedRun` is only ever cleared by a `healthy` observation, and confirming `weakNetwork` requires it to have already reached `downConfirmationCount` — so the moment `weakNetwork` is displayed, the counter is already at threshold. Rearming rule 2 then lets the very next failure of any kind confirm on a **single** observation, defeating the blip protection `downConfirmationCount` exists to provide.
+**2. Reset `_degradedRun` on every `weakNetwork` OBSERVATION — not on confirmation.** Without this, half 1 opens a false-confirm path. `_degradedRun` is only ever cleared by a `healthy` observation, and confirming `weakNetwork` requires it to have already reached `downConfirmationCount` — so the moment `weakNetwork` is displayed, the counter is already at threshold. Rearming rule 2 then lets the very next failure of any kind confirm on a **single** observation, defeating the blip protection `downConfirmationCount` exists to provide.
+
+**Gating the reset on confirmation is not enough, and this is the subtle part.** An *unconfirmed* `weakNetwork` still incremented `_degradedRun` on the way in. Since nothing is on screen yet, `_currentState` is `healthy` and rule 2 is armed — so one slow probe followed by a single failure confirms that failure on one failing observation. Verified: at `downConfirmationCount: 2`, a 4-second 200 followed by one 500 emitted `serverUnreachable`. The reset must be unconditional on the state, placed after both rules:
+
+```dart
+if (state == ConnectionHealthState.weakNetwork) {
+  _degradedRun = 0;
+}
+```
+
+This was caught in code review, not by the original test set — see the third regression test below for why.
 
 With both halves: leaving `weakNetwork` requires a fresh run of `downConfirmationCount` observations, which rule 2 supplies for mixed failures and rule 1 supplies for a steady one.
 
-## Regression test
+## Regression tests
 
-From an established `weakNetwork` at `downConfirmationCount: 2`, alternate `internetDisconnected` and `serverUnreachable` for several probes and assert a failure state is eventually emitted. Fails before the predicate change, passes after.
+Three, not two. The third is the one that matters most, and it was missing from the first attempt at this fix.
 
-Pair it with a blip-protection guard: from an established `weakNetwork`, a **single** failure must still not confirm. That one fails if half 2 is omitted.
+1. **Escalation guard (test 41).** From an established `weakNetwork` at `downConfirmationCount: 2`, alternate `internetDisconnected` and `serverUnreachable` for several probes and assert a failure state is eventually emitted. Fails before the predicate change, passes after.
+2. **Blip guard, rule-1 route (test 42).** From a `weakNetwork` established by two consecutive slow probes, a **single** failure must still not confirm. Fails if half 2 is omitted.
+3. **Blip guard, unconfirmed route (test 44).** One slow probe that does NOT emit, then a single failure — assert nothing is emitted.
+
+**Why 3 is load-bearing.** Tests 1 and 2 both drive `weakNetwork` all the way to confirmation before failing, so both enter the failure step with `_degradedRun` already cleared. The unconfirmed path — where the counter is still primed — is invisible to them. A reset gated on `confirmed` passes both and still ships the bug. Any guard written for this class must reach the failure step from an *unconfirmed* `weakNetwork`, or it is testing the already-safe path.
+
+A fourth (test 43) covers `weakNetwork` reached via rule 2 rather than rule 1 — from `healthy`, one failure then one slow success — since the existing suite only ever reached it by the rule-1 route.
 
 ## Related
 

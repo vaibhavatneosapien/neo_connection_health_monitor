@@ -53,7 +53,8 @@ class ConnectionHealthMonitor {
   /// - [slowThreshold] - a probe that SUCCEEDS but takes longer than
   ///   this reports [ConnectionHealthState.weakNetwork] instead of
   ///   `healthy`. Default: 3 seconds. Must be `> Duration.zero` and
-  ///   `< requestTimeout` (asserted): at or above the timeout the probe
+  ///   `< requestTimeout` (throws [ArgumentError]): at or above the timeout
+  ///   the probe
   ///   is aborted before it could ever be judged slow, leaving
   ///   `weakNetwork` unreachable.
   /// - [downConfirmationCount] - how many consecutive degraded probes are
@@ -228,11 +229,16 @@ class ConnectionHealthMonitor {
   /// How many consecutive times [_streakState] has been observed.
   int _streakCount = 0;
 
-  /// How many consecutive non-`healthy` observations of ANY kind have been
-  /// seen. Distinct from [_streakCount], which restarts whenever the
-  /// specific failure changes; this one does not. It is what lets a link
-  /// that alternates between two failure modes still report SOMETHING —
-  /// see the second rule in [_isConfirmed].
+  /// How many consecutive FAILED observations of any kind have been seen.
+  /// Distinct from [_streakCount], which restarts whenever the specific
+  /// failure changes; this one does not. It is what lets a link that
+  /// alternates between two failure modes still report SOMETHING — see the
+  /// second rule in [_isConfirmed].
+  ///
+  /// `weakNetwork` does NOT count toward it and clears it on observation:
+  /// the probe succeeded, so it is not a failure, and leaving it counted
+  /// would let one slow probe plus one failure confirm on a single failing
+  /// observation.
   int _degradedRun = 0;
 
   // ---------------------------------------------------------------------------
@@ -587,13 +593,16 @@ class ConnectionHealthMonitor {
               _currentState != ConnectionHealthState.weakNetwork;
       confirmed = !reportingDegraded && _degradedRun >= downConfirmationCount;
     }
-    // Confirming `weakNetwork` leaves _degradedRun at threshold — only a
-    // `healthy` observation clears it — which would let rule 2 confirm the
-    // very next single failure and defeat blip protection. Clear it on EVERY
-    // confirming path: `weakNetwork` reaches confirmation through both rules,
-    // and guarding only one of them is the half-applied fix this exists to
-    // prevent.
-    if (confirmed && state == ConnectionHealthState.weakNetwork) {
+    // `weakNetwork` is a SUCCESSFUL probe, so it never contributes to the
+    // generic failure run — cleared on OBSERVATION, not merely on
+    // confirmation. Gating this on `confirmed` would leave the run primed by
+    // an unconfirmed `weakNetwork` (which still incremented it above), and
+    // `_currentState` is then typically `healthy`, so rule 2 is armed: one
+    // slow probe followed by a single failure would confirm that failure on
+    // one observation, defeating the blip protection `downConfirmationCount`
+    // exists to provide. Placed after both rules so it cannot be applied to
+    // one confirming path and missed on the other.
+    if (state == ConnectionHealthState.weakNetwork) {
       _degradedRun = 0;
     }
     return confirmed;

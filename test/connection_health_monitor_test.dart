@@ -1607,8 +1607,37 @@ void main() {
           expect(
             h.emissions,
             [ConnectionHealthState.weakNetwork],
-            reason: 'the _degradedRun reset must apply to rule 2 s exit too, '
-                'not only rule 1 s',
+            reason: 'the _degradedRun reset must apply to rule 2\'s exit too, '
+                'not only rule 1\'s',
+          );
+          h.monitor.dispose();
+        });
+      });
+
+      test('44: an UNCONFIRMED weakNetwork does not prime the failure run', () {
+        fakeAsync((async) {
+          // Tests 42 and 43 both drive weakNetwork to CONFIRMATION before
+          // failing, so both enter the failure step with the run already
+          // cleared. That is why they cannot see this: a weakNetwork that
+          // never emits still incremented the generic failure run, and with
+          // nothing on screen rule 2 is armed — so a single failure would
+          // confirm on one observation.
+          final h = gateHarness()..setDelay(const Duration(seconds: 4));
+          h.monitor.start();
+          async.elapse(const Duration(seconds: 5));
+          async.flushMicrotasks();
+          expect(h.emissions, isEmpty, reason: 'one slow probe is unconfirmed');
+
+          h
+            ..setDelay(Duration.zero)
+            ..setStatus(500);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            isEmpty,
+            reason: 'one slow success plus ONE failure is not two failures — '
+                'a single failure must never confirm',
           );
           h.monitor.dispose();
         });
