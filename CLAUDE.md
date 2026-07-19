@@ -296,6 +296,8 @@ docs/
   solutions/                              # documented solutions to past problems (bugs, decisions, patterns), by category, with YAML frontmatter (module, tags, problem_type); relevant when implementing or debugging in documented areas
 ```
 
+`CONCEPTS.md` at the repo root holds the shared domain vocabulary — the terms with project-specific meaning (`Observation` vs `Reported state`, the confirmation gate's two rules, blip protection). Relevant when orienting to the state machine or discussing these concepts; the distinctions it records are ones this package has gotten wrong before.
+
 Rename existing `lib/src/neo_connection_health_base.dart` once real files exist — don't keep the placeholder.
 
 **Barrel exports.** `lib/neo_connection_health.dart` MUST export both `ConnectionHealthMonitor` AND `ConnectionHealthState`. If only the class is exported, consumers cannot pattern-match on the enum without importing `src/`, which leaks implementation paths and is fragile across refactors. Easy to forget; the barrel file must contain both `export 'src/connection_health_monitor.dart';` and `export 'src/connection_health_state.dart';`.

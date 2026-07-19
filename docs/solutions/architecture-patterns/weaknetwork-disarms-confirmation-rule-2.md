@@ -3,7 +3,7 @@ title: weakNetwork on screen disarms the confirmation gate's generic-failure rul
 date: 2026-07-19
 category: architecture-patterns
 module: connection_health_monitor
-problem_type: bug
+problem_type: architecture_pattern
 component: service_object
 severity: high
 applies_when:
