@@ -334,13 +334,22 @@ void main() {
         monitor.checkNow().then((s) => probed = s);
         async.flushMicrotasks();
         expect(probed, ConnectionHealthState.serverUnreachable);
-        expect(monitor.currentState, ConnectionHealthState.serverUnreachable);
         expect(
             emissions,
             [
               ConnectionHealthState.healthy,
             ],
             reason: 'checkNow must NEVER emit on stream');
+        // The probe result reaches the caller and nowhere else:
+        // currentState is what the STREAM last carried, so a pure probe
+        // must not move it either. Otherwise a late subscriber gets
+        // replayed a value no subscriber was ever sent, and the next loop
+        // tick sees "no change" and never reconciles them.
+        expect(
+          monitor.currentState,
+          ConnectionHealthState.healthy,
+          reason: 'checkNow must not move currentState past the stream',
+        );
         monitor.dispose();
       });
     });
@@ -816,8 +825,9 @@ void main() {
     });
 
     // -------------------------------------------------------------------
-    // 22: checkNow() BEFORE start() — probes once, updates currentState,
-    // and does NOT schedule a loop (nothing running to reschedule).
+    // 22: checkNow() BEFORE start() — probes once, reports only through
+    // its return value, and does NOT schedule a loop (nothing running to
+    // reschedule).
     // -------------------------------------------------------------------
     test('22: checkNow() before start() probes without scheduling', () {
       fakeAsync((async) {
@@ -839,7 +849,11 @@ void main() {
         expect(probed, ConnectionHealthState.healthy);
         expect(hits, 1);
         expect(emissions, isEmpty, reason: 'checkNow never emits');
-        expect(monitor.currentState, ConnectionHealthState.healthy);
+        expect(
+          monitor.currentState,
+          ConnectionHealthState.initial,
+          reason: 'nothing emitted yet, so nothing to report',
+        );
 
         // No loop was scheduled (monitor never started).
         async.elapse(const Duration(minutes: 5));
@@ -850,13 +864,14 @@ void main() {
     });
 
     // -------------------------------------------------------------------
-    // 23: a state-changing checkNow() moves currentState ahead of the
-    // de-dupe baseline; a late subscriber must still receive the value
-    // only ONCE (per-subscriber de-dupe), not a duplicate when the next
-    // loop tick re-emits it.
+    // 23: a state-changing checkNow() must NOT move currentState ahead of
+    // the stream. Regression guard: while it did, a late subscriber was
+    // replayed a state no subscriber had ever been sent, and the next loop
+    // tick saw "no change" — so the two never reconciled. Fixing that made
+    // the old per-subscriber replay de-dupe unnecessary; this test now
+    // proves the divergence itself cannot occur.
     // -------------------------------------------------------------------
-    test('23: no duplicate to late subscriber after state-changing checkNow',
-        () {
+    test('23: checkNow() cannot move currentState ahead of the stream', () {
       fakeAsync((async) {
         var statusCode = 200;
         final existing = <ConnectionHealthState>[];
@@ -871,30 +886,35 @@ void main() {
         async.flushMicrotasks();
         expect(existing, [ConnectionHealthState.healthy]);
 
-        // Silent checkNow moves currentState ahead of _lastState.
         statusCode = 500;
         monitor.checkNow();
         async.flushMicrotasks();
-        expect(monitor.currentState, ConnectionHealthState.serverUnreachable);
+        expect(
+          monitor.currentState,
+          ConnectionHealthState.healthy,
+          reason: 'the probe result belongs to the caller, not to the state',
+        );
         expect(existing, [ConnectionHealthState.healthy]);
 
+        // A subscriber arriving in that window is replayed the emitted
+        // state, not the private probe result.
         final late = <ConnectionHealthState>[];
         monitor.stream.listen(late.add);
         async.flushMicrotasks();
-        expect(late, [ConnectionHealthState.serverUnreachable]);
+        expect(late, [ConnectionHealthState.healthy]);
 
-        // Next tick re-broadcasts serverUnreachable to all subscribers.
+        // The next scheduled tick observes the same failure and emits it
+        // once, to everyone.
         async.elapse(const Duration(seconds: 6));
         async.flushMicrotasks();
         expect(existing, [
           ConnectionHealthState.healthy,
           ConnectionHealthState.serverUnreachable,
         ]);
-        expect(
-          late,
-          [ConnectionHealthState.serverUnreachable],
-          reason: 'per-subscriber de-dupe suppresses the repeat',
-        );
+        expect(late, [
+          ConnectionHealthState.healthy,
+          ConnectionHealthState.serverUnreachable,
+        ]);
         monitor.dispose();
       });
     });
@@ -943,10 +963,12 @@ void main() {
 
     // -------------------------------------------------------------------
     // 26: a 2xx that takes longer than slowThreshold → weakNetwork, and it
-    // is polled at retryInterval (not healthyInterval) so recovery is seen
-    // quickly.
+    // is polled at healthyInterval (NOT retryInterval): the probe
+    // succeeded, so there is no outage to recover from, and the fast
+    // cadence would burn ~1440 requests/day on the connections least able
+    // to spare them.
     // -------------------------------------------------------------------
-    test('26: slow 200 → weakNetwork, next check at retryInterval', () {
+    test('26: slow 200 → weakNetwork, next check at healthyInterval', () {
       fakeAsync((async) {
         var hits = 0;
         final emissions = <ConnectionHealthState>[];
@@ -970,16 +992,20 @@ void main() {
         expect(emissions, [ConnectionHealthState.weakNetwork]);
         expect(hits, 1);
 
-        // retryInterval (1 min) governs, not healthyInterval (5 min). The
+        // healthyInterval (5 min) governs, not retryInterval (1 min). The
         // delay is measured from the check's COMPLETION (t=4s), so the next
-        // probe lands at t=64s — we are at t=5s here.
-        async.elapse(const Duration(seconds: 58));
+        // probe lands at t=304s — we are at t=5s here.
+        async.elapse(const Duration(minutes: 1));
         async.flushMicrotasks();
-        expect(hits, 1, reason: 'no early re-probe');
+        expect(
+          hits,
+          1,
+          reason: 'a retryInterval passing must NOT trigger a re-probe',
+        );
 
-        async.elapse(const Duration(seconds: 2));
+        async.elapse(const Duration(minutes: 4, seconds: 5));
         async.flushMicrotasks();
-        expect(hits, 2, reason: 'weakNetwork re-probes at retryInterval');
+        expect(hits, 2, reason: 'weakNetwork re-probes at healthyInterval');
         monitor.dispose();
       });
     });
@@ -1024,7 +1050,9 @@ void main() {
           }),
           internetChecker: _FakeInternetConnection(online: true),
           slowThreshold: const Duration(seconds: 3),
-          retryInterval: const Duration(seconds: 30),
+          // weakNetwork reschedules on the healthy cadence, so this is the
+          // interval that governs the re-probe below.
+          healthyInterval: const Duration(seconds: 30),
         );
         monitor.stream.listen(emissions.add);
         monitor.start();
@@ -1046,18 +1074,19 @@ void main() {
     });
 
     // -------------------------------------------------------------------
-    // 29: slowThreshold outside (0, requestTimeout) is a programmer error
+    // 29: slowThreshold outside (0, requestTimeout) is a misconfiguration
     // — at/above the timeout the probe aborts before it can be judged
-    // slow, so weakNetwork would be unreachable.
+    // slow, so weakNetwork would be unreachable. ArgumentError, not an
+    // assert: it must fail in release too, where asserts are stripped.
     // -------------------------------------------------------------------
-    test('29: slowThreshold outside (0, requestTimeout) asserts', () {
+    test('29: slowThreshold outside (0, requestTimeout) throws', () {
       expect(
         () => ConnectionHealthMonitor(
           baseUrl: 'https://api.example.com',
           requestTimeout: const Duration(seconds: 8),
           slowThreshold: const Duration(seconds: 8),
         ),
-        throwsA(isA<AssertionError>()),
+        throwsA(isA<ArgumentError>()),
         reason: 'slowThreshold == requestTimeout makes weakNetwork dead code',
       );
       expect(
@@ -1065,7 +1094,7 @@ void main() {
           baseUrl: 'https://api.example.com',
           slowThreshold: Duration.zero,
         ),
-        throwsA(isA<AssertionError>()),
+        throwsA(isA<ArgumentError>()),
         reason: 'slowThreshold must be > 0',
       );
     });
@@ -1155,11 +1184,19 @@ void main() {
         });
       });
 
-      test('32: two DIFFERENT bad states in a row confirm neither', () {
+      // 32: alternating failure modes must still report SOMETHING. Under a
+      // purely per-state run they never build a matching streak, so nothing
+      // was ever emitted — the app looked perfectly healthy while every
+      // request failed, and it never self-corrected. Rule 2 (N consecutive
+      // failures of ANY kind, while nothing degraded is on screen yet)
+      // closes that hole. Matches how Kubernetes failureThreshold, gRPC and
+      // Resilience4j count failure: generically, not per sub-type.
+      test('32: alternating bad states still confirm from a cold start', () {
         fakeAsync((async) {
           final h = harness();
           h.monitor.start();
           async.flushMicrotasks(); // probe 1 -> internetDisconnected
+          expect(h.emissions, isEmpty, reason: 'one failure is still a blip');
 
           // Same failing server, but the internet probe now succeeds, so
           // this reads as serverUnreachable rather than a repeat.
@@ -1169,10 +1206,53 @@ void main() {
 
           expect(
             h.emissions,
-            isEmpty,
-            reason: 'two different failures are not a consistent story',
+            [ConnectionHealthState.serverUnreachable],
+            reason: 'two failures running is proof enough that we are down, '
+                'even without agreement on which kind',
           );
-          expect(h.monitor.currentState, ConnectionHealthState.initial);
+          h.monitor.dispose();
+        });
+      });
+
+      // 32b: the other half of the contract. Once a degraded state IS on
+      // screen, rule 2 switches off and the per-state run governs the
+      // label — otherwise every alternating probe would pass the gate and
+      // the banner would swap its advice ("check your WiFi" / "our servers
+      // are down") once a minute, which is worse than holding one answer.
+      test('32b: an established banner does not flap between failure modes',
+          () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks(); // 1 -> internetDisconnected
+          h.setOnline(online: true);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks(); // 2 -> serverUnreachable, emits
+          expect(h.emissions, [ConnectionHealthState.serverUnreachable]);
+
+          // Alternate for several more probes. None may emit: no state
+          // manages two in a row, and the banner is no longer empty.
+          for (var i = 0; i < 4; i++) {
+            h.setOnline(online: i.isOdd);
+            async.elapse(const Duration(seconds: 31));
+            async.flushMicrotasks();
+          }
+          expect(
+            h.emissions,
+            [ConnectionHealthState.serverUnreachable],
+            reason: 'the label holds until a different one earns its own run',
+          );
+
+          // A genuine consecutive pair of the other kind DOES take over.
+          h.setOnline(online: false);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.emissions, [
+            ConnectionHealthState.serverUnreachable,
+            ConnectionHealthState.internetDisconnected,
+          ]);
           h.monitor.dispose();
         });
       });
@@ -1236,7 +1316,10 @@ void main() {
             internetChecker: _FakeInternetConnection(online: true),
             slowThreshold: const Duration(seconds: 3),
             downConfirmationCount: 2,
-            retryInterval: const Duration(seconds: 30),
+            // weakNetwork reschedules on the HEALTHY cadence (the probe
+            // succeeded), so confirmation of a slow link arrives one
+            // healthyInterval later — not one retryInterval.
+            healthyInterval: const Duration(seconds: 30),
           );
           monitor.stream.listen(emissions.add);
           monitor.start();
@@ -1312,6 +1395,223 @@ void main() {
           throwsA(isA<AssertionError>()),
           reason: '0 would mean a state is never confirmed',
         );
+      });
+
+      // -----------------------------------------------------------------
+      // 39: stop() discards a partial confirmation run. Two observations
+      // either side of a pause are not consecutive in any useful sense,
+      // and stop()/start() on background/foreground is the pattern this
+      // package itself recommends — so without the reset, every
+      // backgrounded app would confirm on a probe from hours ago.
+      // -----------------------------------------------------------------
+      test('39: stop() resets the confirmation streak', () {
+        fakeAsync((async) {
+          final h = harness();
+          h.monitor.start();
+          async.flushMicrotasks();
+          expect(h.emissions, isEmpty, reason: '1 of 2 — not yet confirmed');
+
+          h.monitor.stop();
+          async.elapse(const Duration(hours: 3));
+          h.monitor.start();
+          async.flushMicrotasks();
+
+          expect(
+            h.emissions,
+            isEmpty,
+            reason: 'the pre-pause probe must not count toward the run',
+          );
+
+          // A second post-resume observation is a genuine consecutive pair.
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.internetDisconnected]);
+          h.monitor.dispose();
+        });
+      });
+
+      // -----------------------------------------------------------------
+      // 40: the slowThreshold comparison is `>`, so a probe landing on the
+      // threshold exactly is healthy, not weakNetwork. Pins the boundary
+      // so a later `>=` typo cannot slip through silently.
+      // -----------------------------------------------------------------
+      test('40: a probe exactly at slowThreshold is healthy', () {
+        fakeAsync((async) {
+          final emissions = <ConnectionHealthState>[];
+          final monitor = _build(
+            httpClient: MockClient((_) async {
+              await Future<void>.delayed(const Duration(seconds: 3));
+              return http.Response('ok', 200);
+            }),
+            internetChecker: _FakeInternetConnection(online: true),
+            slowThreshold: const Duration(seconds: 3),
+          );
+          monitor.stream.listen(emissions.add);
+          monitor.start();
+
+          async.elapse(const Duration(seconds: 4));
+          async.flushMicrotasks();
+          expect(
+            emissions,
+            [ConnectionHealthState.healthy],
+            reason: 'the threshold is exclusive — equal is not yet slow',
+          );
+          monitor.dispose();
+        });
+      });
+
+      /// Like [harness], but the probe's LATENCY is mutable too, so one test
+      /// can walk a monitor from a slow-but-successful probe (`weakNetwork`)
+      /// into outright failures. Both intervals are 30 s so the cadence
+      /// difference between an answered and a failed probe does not have to
+      /// be tracked per step.
+      ({
+        ConnectionHealthMonitor monitor,
+        List<ConnectionHealthState> emissions,
+        void Function(Duration d) setDelay,
+        void Function(int status) setStatus,
+        void Function({required bool online}) setOnline,
+      }) gateHarness() {
+        var delay = Duration.zero;
+        var status = 200;
+        final checker = _FakeInternetConnection(online: true);
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            if (delay > Duration.zero) {
+              await Future<void>.delayed(delay);
+            }
+            return http.Response('', status);
+          }),
+          internetChecker: checker,
+          slowThreshold: const Duration(seconds: 3),
+          downConfirmationCount: 2,
+          healthyInterval: const Duration(seconds: 30),
+          retryInterval: const Duration(seconds: 30),
+        );
+        monitor.stream.listen(emissions.add);
+        return (
+          monitor: monitor,
+          emissions: emissions,
+          setDelay: (d) => delay = d,
+          setStatus: (s) => status = s,
+          setOnline: ({required bool online}) => checker.online = online,
+        );
+      }
+
+      test(
+          '41: weakNetwork does not disarm rule 2 — alternating failures '
+          'still confirm', () {
+        fakeAsync((async) {
+          final h = gateHarness()..setDelay(const Duration(seconds: 4));
+          h.monitor.start();
+
+          // Two slow-but-successful probes confirm weakNetwork (rule 1).
+          async.elapse(const Duration(seconds: 5));
+          async.flushMicrotasks();
+          expect(h.emissions, isEmpty,
+              reason: 'one slow response is not proof');
+          async.elapse(const Duration(seconds: 35));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.weakNetwork]);
+
+          // Now the link degrades into ALTERNATING failure modes. Rule 1 can
+          // never fire (no state twice in a row), so the only route out is
+          // rule 2 — which stays armed only because weakNetwork is exempt
+          // from `reportingDegraded`.
+          h
+            ..setDelay(Duration.zero)
+            ..setStatus(500)
+            ..setOnline(online: false);
+          async.elapse(const Duration(seconds: 30));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [ConnectionHealthState.weakNetwork],
+            reason: 'one failure is still just a blip',
+          );
+
+          h.setOnline(online: true);
+          async.elapse(const Duration(seconds: 30));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [
+              ConnectionHealthState.weakNetwork,
+              ConnectionHealthState.serverUnreachable,
+            ],
+            reason: 'without the weakNetwork exemption this confirms NOTHING, '
+                'forever — a reassuring banner on a fully offline device',
+          );
+          h.monitor.dispose();
+        });
+      });
+
+      test('42: leaving a rule-1 weakNetwork still needs a full run', () {
+        fakeAsync((async) {
+          final h = gateHarness()..setDelay(const Duration(seconds: 4));
+          h.monitor.start();
+
+          async.elapse(const Duration(seconds: 5));
+          async.flushMicrotasks();
+          async.elapse(const Duration(seconds: 35));
+          async.flushMicrotasks();
+          expect(h.emissions, [ConnectionHealthState.weakNetwork]);
+
+          // Confirming weakNetwork left _degradedRun at threshold unless it
+          // was cleared. If it was not, rule 2 fires on this SINGLE failure.
+          h
+            ..setDelay(Duration.zero)
+            ..setStatus(500)
+            ..setOnline(online: false);
+          async.elapse(const Duration(seconds: 30));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [ConnectionHealthState.weakNetwork],
+            reason: 'blip protection must survive the rule-2 rearm',
+          );
+          h.monitor.dispose();
+        });
+      });
+
+      test('43: leaving a rule-2 weakNetwork still needs a full run', () {
+        fakeAsync((async) {
+          // weakNetwork reached through rule 2 rather than rule 1: one
+          // failure, then one slow success, from a cold start. No other test
+          // takes this route, and a fix applied to rule 1's exit alone
+          // leaves _degradedRun primed here.
+          final h = gateHarness()..setStatus(500);
+          h.monitor.start();
+          async.flushMicrotasks();
+          expect(h.emissions, isEmpty, reason: 'one failure is not proof');
+
+          h
+            ..setDelay(const Duration(seconds: 4))
+            ..setStatus(200);
+          async.elapse(const Duration(seconds: 35));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [ConnectionHealthState.weakNetwork],
+            reason: 'serverUnreachable then a slow 200 is two degraded '
+                'observations of any kind — rule 2 confirms the second',
+          );
+
+          h
+            ..setDelay(Duration.zero)
+            ..setStatus(500)
+            ..setOnline(online: false);
+          async.elapse(const Duration(seconds: 31));
+          async.flushMicrotasks();
+          expect(
+            h.emissions,
+            [ConnectionHealthState.weakNetwork],
+            reason: 'the _degradedRun reset must apply to rule 2 s exit too, '
+                'not only rule 1 s',
+          );
+          h.monitor.dispose();
+        });
       });
     });
   });

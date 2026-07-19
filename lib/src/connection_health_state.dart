@@ -25,15 +25,29 @@ enum ConnectionHealthState {
   /// that uploads will visibly lag.
   ///
   /// This is a latency verdict on one request, not a bandwidth
-  /// measurement — a single slow probe on an otherwise fine network will
-  /// report it. That is deliberate: the banner it drives is advisory
-  /// ("your memory will sync once the connection improves"), so a false
-  /// positive costs the user nothing, while a missed slow network leaves
-  /// them staring at a stalled upload with no explanation.
+  /// measurement. At the default `downConfirmationCount: 1` a single slow
+  /// probe on an otherwise fine network is enough to report it. That is
+  /// deliberate: the banner it drives is advisory ("your memory will sync
+  /// once the connection improves"), so a false positive costs the user
+  /// nothing, while a missed slow network leaves them staring at a stalled
+  /// upload with no explanation. Consumers that would rather wait for a
+  /// consistent story can raise `downConfirmationCount`, which applies to
+  /// this state like any other non-`healthy` one.
   ///
-  /// Polled at `retryInterval`, not `healthyInterval` — a degraded
-  /// connection should be re-checked at the same cadence as a broken one
-  /// so recovery is noticed quickly.
+  /// Polled at `healthyInterval`, NOT `retryInterval` — the probe
+  /// succeeded, so there is no outage to recover from. Re-checking a
+  /// working-but-slow link five times as often would sustain ~1440
+  /// requests a day, and the radio wakeups with them, on exactly the
+  /// connections least able to spare either. Recovery is noticed within
+  /// one `healthyInterval`, which is soon enough for an advisory banner.
+  ///
+  /// Because the probe SUCCEEDED, this state does not count as "something
+  /// degraded is on screen" for the confirmation gate's generic-failure
+  /// rule — it belongs semantically with [healthy] despite sitting among
+  /// the failure values here. A link that degrades out of `weakNetwork`
+  /// into alternating failure modes can therefore still confirm one.
+  /// Without that exemption the gate locks open and the advisory banner
+  /// below stays on screen while the device is fully offline.
   ///
   /// UI hint: "Weak Network" — no action available, capture continues.
   weakNetwork,

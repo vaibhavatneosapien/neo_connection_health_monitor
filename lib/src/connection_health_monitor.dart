@@ -12,9 +12,9 @@ import 'connection_health_state.dart';
 ///
 /// Construct one instance at app startup, [start] it, and listen to
 /// [stream]. The monitor performs a dual-tier check on an adaptive
-/// schedule (every [healthyInterval] when healthy, every
-/// [retryInterval] otherwise, each with +/-[jitterRatio] jitter to
-/// avoid synchronized thundering-herd load on the backend).
+/// schedule (every [healthyInterval] while the server answers, every
+/// [retryInterval] while the probe fails, each with +/-[jitterRatio]
+/// jitter to avoid synchronized thundering-herd load on the backend).
 ///
 /// ## Caller responsibility - backgrounding
 ///
@@ -43,10 +43,11 @@ class ConnectionHealthMonitor {
   ///   environment, so the default would yield a permanent
   ///   `serverUnreachable`. The default stays `/health` because it is
   ///   the conventional choice for a reusable package.
-  /// - [healthyInterval] - delay between checks after a `healthy`
-  ///   observation. Default: 5 minutes.
-  /// - [retryInterval] - delay between checks after any non-`healthy`
-  ///   observation. Default: 1 minute.
+  /// - [healthyInterval] - delay between checks after the server
+  ///   ANSWERED, i.e. `healthy` or `weakNetwork`. Default: 5 minutes.
+  /// - [retryInterval] - delay between checks after the server probe
+  ///   FAILED, i.e. `internetDisconnected` or `serverUnreachable`.
+  ///   Default: 1 minute.
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
   ///   (chosen over 5 s for 3G on tier-2 networks).
   /// - [slowThreshold] - a probe that SUCCEEDS but takes longer than
@@ -55,15 +56,16 @@ class ConnectionHealthMonitor {
   ///   `< requestTimeout` (asserted): at or above the timeout the probe
   ///   is aborted before it could ever be judged slow, leaving
   ///   `weakNetwork` unreachable.
-  /// - [downConfirmationCount] - how many consecutive probes must report
-  ///   the SAME degraded state before it is emitted. Default `1`
-  ///   (emit on first observation - the historical behaviour, so
-  ///   existing consumers are unaffected). Must be `>= 1` (asserted).
-  ///   Set `2`+ to stop a single blip - a lift, a tunnel, one overloaded
-  ///   response - from putting an error state in front of the user.
-  ///   Recovery to `healthy` is never delayed by this. See
-  ///   [_isConfirmed] for why the run is keyed on the specific state
-  ///   rather than on "something was wrong".
+  /// - [downConfirmationCount] - how many consecutive degraded probes are
+  ///   required before the state is emitted. Default `1` (emit on first
+  ///   observation - the historical behaviour, so existing consumers are
+  ///   unaffected). Must be `>= 1` (asserted). Set `2`+ to stop a single
+  ///   blip - a lift, a tunnel, one overloaded response - from putting an
+  ///   error state in front of the user. Recovery to `healthy` is never
+  ///   delayed by this. Two rules apply: N observations of the SAME state,
+  ///   or N of ANY kind while nothing degraded is reported yet - see
+  ///   [_isConfirmed] for why both are needed and why a link alternating
+  ///   between two failure modes would otherwise report nothing at all.
   /// - [jitterRatio] - +/- random jitter fraction on each delay.
   ///   Default: 0.1 (+/-10%); pass `0.0` to disable. See the field for
   ///   the `[0, 1)` bound.
@@ -96,10 +98,6 @@ class ConnectionHealthMonitor {
           'jitterRatio must be in [0, 1)',
         ),
         assert(
-          slowThreshold > Duration.zero && slowThreshold < requestTimeout,
-          'slowThreshold must be in (0, requestTimeout)',
-        ),
-        assert(
           downConfirmationCount >= 1,
           'downConfirmationCount must be >= 1',
         ),
@@ -109,17 +107,34 @@ class ConnectionHealthMonitor {
         _internetChecker =
             internetChecker ?? InternetConnection.createInstance(),
         _random = random ?? Random(),
-        _uri = _composeUri(baseUrl, healthPath);
+        _uri = _composeUri(baseUrl, healthPath) {
+    // ArgumentError, not `assert`: asserts are stripped in release, so a
+    // consumer who raises `requestTimeout` (e.g. tuning for 3G) without
+    // moving `slowThreshold` would silently lose `weakNetwork` entirely in
+    // the shipped build while tests stayed green. Fails loud at construction
+    // instead, matching [_composeUri]'s handling of a bad `baseUrl`.
+    if (slowThreshold <= Duration.zero || slowThreshold >= requestTimeout) {
+      throw ArgumentError.value(
+        slowThreshold,
+        'slowThreshold',
+        'must be in (0, requestTimeout=$requestTimeout) — at or above the '
+            'timeout the probe aborts before it can be judged slow, making '
+            'weakNetwork unreachable',
+      );
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Configuration (immutable after construction).
   // ---------------------------------------------------------------------------
 
-  /// Delay between checks while the last observed state is `healthy`.
+  /// Delay between checks while the server is ANSWERING — `healthy` or
+  /// `weakNetwork`. See [_nextDelay] for why slow-but-working shares the
+  /// relaxed cadence.
   final Duration healthyInterval;
 
-  /// Delay between checks while the last observed state is not
-  /// `healthy`.
+  /// Delay between checks while the server probe is FAILING —
+  /// `internetDisconnected` or `serverUnreachable`.
   final Duration retryInterval;
 
   /// Per-request timeout for the server `/health` probe.
@@ -195,13 +210,14 @@ class ConnectionHealthMonitor {
   /// rate.
   int _generation = 0;
 
-  /// Cached most-recent state. Returned by [currentState] and used as
-  /// the de-dupe baseline; starts as [ConnectionHealthState.initial].
+  /// Last state emitted on [stream]. Doubles as the de-dupe baseline and
+  /// as the value [currentState] returns, which is what keeps the two in
+  /// lockstep: this field is assigned in exactly one place
+  /// ([_emitIfChanged]), immediately before the matching
+  /// `_controller.add`. Nothing else may write it — an ungated write is
+  /// how `currentState` previously drifted to a value the stream had
+  /// never carried, with no path back into agreement.
   ConnectionHealthState _currentState = ConnectionHealthState.initial;
-
-  /// Last state emitted on [stream]; the de-dupe baseline (see
-  /// [_emitIfChanged]).
-  ConnectionHealthState _lastState = ConnectionHealthState.initial;
 
   /// The degraded state currently being counted toward
   /// [downConfirmationCount], or `null` when the last observation was
@@ -211,6 +227,13 @@ class ConnectionHealthMonitor {
 
   /// How many consecutive times [_streakState] has been observed.
   int _streakCount = 0;
+
+  /// How many consecutive non-`healthy` observations of ANY kind have been
+  /// seen. Distinct from [_streakCount], which restarts whenever the
+  /// specific failure changes; this one does not. It is what lets a link
+  /// that alternates between two failure modes still report SOMETHING —
+  /// see the second rule in [_isConfirmed].
+  int _degradedRun = 0;
 
   // ---------------------------------------------------------------------------
   // Public API.
@@ -244,33 +267,28 @@ class ConnectionHealthMonitor {
       controller.close();
       return;
     }
-    ConnectionHealthState? replayed;
     if (_currentState != ConnectionHealthState.initial) {
-      replayed = _currentState;
       controller.add(_currentState);
     }
+    // No per-subscriber de-dupe needed: `_currentState` is written only in
+    // `_emitIfChanged`, immediately before the matching `add`, so the value
+    // replayed above is by construction the last one broadcast — and the
+    // next broadcast is guaranteed to differ from it.
     final sub = _controller.stream.listen(
-      (state) {
-        // Per-subscriber de-dupe: a silent `checkNow()` can move
-        // `_currentState` ahead of the broadcast de-dupe baseline
-        // (`_lastState`), so a late subscriber that just replayed the
-        // fresh value would otherwise receive the same value again when
-        // the next loop tick re-emits it. Drop that first repeat.
-        if (replayed != null) {
-          final justReplayed = replayed;
-          replayed = null;
-          if (state == justReplayed) return;
-        }
-        controller.add(state);
-      },
+      controller.add,
       onError: controller.addError,
       onDone: controller.close,
     );
     controller.onCancel = sub.cancel;
   });
 
-  /// The most recently observed state, or
-  /// [ConnectionHealthState.initial] if no check has completed yet.
+  /// The most recent state EMITTED on [stream], or
+  /// [ConnectionHealthState.initial] if nothing has been emitted yet.
+  ///
+  /// This is never a raw probe result: an unconfirmed observation (see
+  /// `downConfirmationCount`) and a [checkNow] result both leave it
+  /// untouched. It reports what a subscriber has been told, so the two can
+  /// never disagree.
   ///
   /// Warning: this returns `initial` between construction and the first
   /// completed check. Do NOT render UI from a synchronous read of this
@@ -302,11 +320,21 @@ class ConnectionHealthMonitor {
   /// subsequent [start] resumes cleanly. Call this when the app is
   /// backgrounded — not on `inactive` (see the class docs for the
   /// backgrounding contract). For shutdown, use [dispose].
+  ///
+  /// Any partial confirmation run (see [downConfirmationCount]) is
+  /// discarded: observations either side of a pause are not consecutive in
+  /// any meaningful sense, and the recommended background/foreground
+  /// pattern would otherwise let a probe from hours ago confirm a state
+  /// alongside one from just now.
   void stop() {
     _throwIfDisposed();
     _running = false;
     _pendingTimer?.cancel();
     _pendingTimer = null;
+    // A run spans a pause only by accident; see the doc comment above.
+    _streakState = null;
+    _streakCount = 0;
+    _degradedRun = 0;
   }
 
   /// Terminal cleanup. Cancels the pending timer, closes the broadcast
@@ -344,15 +372,25 @@ class ConnectionHealthMonitor {
   /// Performs a one-off health check immediately and returns the
   /// observed state.
   ///
-  /// Pure probe: does NOT emit on [stream]. It DOES update
-  /// [currentState] and reset the schedule so the next polling delay
-  /// is measured from this call's completion. Use it from a retry
-  /// button that wants the result locally (e.g. to drive a spinner or
-  /// toast) without going through the stream.
+  /// Pure probe: the returned [Future] is the ONLY delivery path. It does
+  /// not emit on [stream] and does not move [currentState] — both continue
+  /// to report the last state the polling loop confirmed. Use it from a
+  /// retry button that wants the result locally (e.g. to drive a spinner
+  /// or toast).
   ///
-  /// Callers that expect a stream emission will get silent breakage -
-  /// subscribe to [stream] for emissions, await [checkNow] for the
-  /// return value.
+  /// It does reset the schedule, so the next polling delay is measured
+  /// from this call's completion rather than from the previous tick.
+  ///
+  /// Why it leaves [currentState] alone: a lone probe has not cleared the
+  /// [downConfirmationCount] gate, and writing it here would let
+  /// `currentState` (and therefore the value replayed to a late
+  /// subscriber) report something [stream] never carried — a disagreement
+  /// with no path back, since the next loop tick sees "no change" and
+  /// stays silent. One writer, one gate.
+  ///
+  /// Consequence worth knowing: a retry that succeeds does not itself
+  /// clear a banner driven by [stream]. Act on the returned value, or
+  /// wait for the next scheduled tick.
   Future<ConnectionHealthState> checkNow() async {
     _throwIfDisposed();
     _pendingTimer?.cancel();
@@ -363,7 +401,6 @@ class ConnectionHealthMonitor {
     final gen = ++_generation;
     final state = await _runCheck();
     if (_disposed) return state;
-    _currentState = state;
     if (_running && gen == _generation) {
       _pendingTimer = Timer(_nextDelay(state), () {
         unawaited(_loop(gen));
@@ -459,58 +496,125 @@ class ConnectionHealthMonitor {
     return ok;
   }
 
-  /// Updates [_currentState] and emits on [_controller] only if the
-  /// state differs from the last emission. `initial` is a valid
-  /// previous-state baseline so the first non-`initial` observation
-  /// emits exactly one event.
+  /// The single writer of [_currentState]: emits on [_controller] only if
+  /// the state differs from the last emission, and records it in the same
+  /// breath. `initial` is a valid previous-state baseline so the first
+  /// non-`initial` observation emits exactly one event.
   ///
   /// A degraded [state] must first clear [_isConfirmed]; until it does,
-  /// this returns without touching [_currentState] or [_lastState], so an
-  /// unconfirmed observation is invisible to BOTH the stream and
-  /// [currentState] (a late subscriber is replayed [_currentState], and
-  /// must never receive a value the stream itself never emitted).
+  /// this returns without touching [_currentState], so an unconfirmed
+  /// observation is invisible to BOTH the stream and [currentState] (a
+  /// late subscriber is replayed [_currentState], and must never receive a
+  /// value the stream itself never emitted).
   void _emitIfChanged(ConnectionHealthState state) {
     if (!_isConfirmed(state)) return;
+    if (state == _currentState) return;
     _currentState = state;
-    if (state == _lastState) return;
-    _lastState = state;
     if (!_controller.isClosed) _controller.add(state);
   }
 
   /// Consecutive-observation gate: `true` once [state] may be reported.
   ///
-  /// `healthy` always passes immediately and clears the streak — recovery
-  /// is never delayed (the inverse of the circuit-breaker convention,
+  /// `healthy` always passes immediately and clears both runs — recovery is
+  /// never delayed (the inverse of the circuit-breaker convention,
   /// deliberately: a breaker trips fast to shield a fragile downstream
   /// from a retry storm, which is not what one polling client is doing).
   ///
-  /// A degraded state must be observed [downConfirmationCount] times in a
-  /// row, and the run is keyed on the state ITSELF, not on
-  /// "something was wrong". `internetDisconnected` then `serverUnreachable`
-  /// restarts the count rather than confirming either — two different
-  /// failures are not yet a consistent story, and a generic counter would
-  /// announce a state it had only actually observed once.
+  /// A degraded state passes on either of two rules.
+  ///
+  /// **Rule 1 — the same state, [downConfirmationCount] times in a row.**
+  /// Keyed on the state ITSELF, not on "something was wrong", so
+  /// `internetDisconnected` then `serverUnreachable` confirms neither: two
+  /// different failures are not yet a consistent story, and swapping the
+  /// banner's advice ("check your WiFi" vs "our servers are down") on every
+  /// probe is worse than picking one and holding it.
+  ///
+  /// **Rule 2 — [downConfirmationCount] consecutive failures of ANY kind,
+  /// while nothing degraded is being reported yet.** Rule 1 alone has a
+  /// hole: a link alternating between two failure modes never builds a
+  /// same-state run, so it would report NOTHING, forever — the app looks
+  /// perfectly healthy while every request fails. Rule 2 closes it. Once a
+  /// degraded state IS on screen, rule 2 stops applying and rule 1 governs
+  /// the label again, so an established banner cannot flap between two
+  /// failure modes on alternating probes.
+  ///
+  /// **`weakNetwork` is exempt from "degraded is on screen".** It is a
+  /// SUCCESSFUL probe — the server answered, just slowly — so it belongs
+  /// semantically with `healthy` despite sitting among the failure values.
+  /// Counting it as an established banner disarmed rule 2 and re-opened the
+  /// never-confirms trap: reach `weakNetwork` from a slow link, then degrade
+  /// into ALTERNATING failure modes, and neither rule can ever fire. The
+  /// user holds a reassuring "connection will improve" banner on a fully
+  /// offline device, forever. Escalating out of `weakNetwork` is therefore
+  /// allowed generically.
+  ///
+  /// Blip protection survives both rules: a single failure can never pass,
+  /// because rule 2 also requires [downConfirmationCount] observations. That
+  /// holds on exit from `weakNetwork` only because confirming `weakNetwork`
+  /// also clears [_degradedRun] — otherwise the counter would already sit at
+  /// threshold the moment the banner appeared, and the exemption above would
+  /// let the next single failure through on one observation.
+  ///
+  /// This split follows the industry precedent rather than inventing one.
+  /// Kubernetes `failureThreshold`, gRPC's connectivity state machine and
+  /// Resilience4j all count failure as a GENERIC condition rather than
+  /// matching a specific failure sub-type — which is exactly what avoids
+  /// the never-confirms trap. Per-state matching is retained on top of that
+  /// only where it earns its keep: choosing WHICH label to show, and
+  /// keeping it steady once shown.
   bool _isConfirmed(ConnectionHealthState state) {
     if (state == ConnectionHealthState.healthy) {
       _streakState = null;
       _streakCount = 0;
+      _degradedRun = 0;
       return true;
     }
+    _degradedRun++;
     if (state == _streakState) {
       _streakCount++;
     } else {
       _streakState = state;
       _streakCount = 1;
     }
-    return _streakCount >= downConfirmationCount;
+    var confirmed = _streakCount >= downConfirmationCount;
+    if (!confirmed) {
+      // Rule 2 — only while the user is being shown nothing. `weakNetwork`
+      // counts as nothing: it is a SUCCESSFUL probe, so escalating out of it
+      // must stay generically available.
+      final reportingDegraded =
+          _currentState != ConnectionHealthState.healthy &&
+              _currentState != ConnectionHealthState.initial &&
+              _currentState != ConnectionHealthState.weakNetwork;
+      confirmed = !reportingDegraded && _degradedRun >= downConfirmationCount;
+    }
+    // Confirming `weakNetwork` leaves _degradedRun at threshold — only a
+    // `healthy` observation clears it — which would let rule 2 confirm the
+    // very next single failure and defeat blip protection. Clear it on EVERY
+    // confirming path: `weakNetwork` reaches confirmation through both rules,
+    // and guarding only one of them is the half-applied fix this exists to
+    // prevent.
+    if (confirmed && state == ConnectionHealthState.weakNetwork) {
+      _degradedRun = 0;
+    }
+    return confirmed;
   }
 
-  /// Next delay: `healthyInterval` if [state] is `healthy`, else
-  /// `retryInterval`, with uniform `±jitterRatio` jitter.
+  /// Next delay: [healthyInterval] when the server ANSWERED (`healthy` or
+  /// `weakNetwork`), [retryInterval] when it did not, with uniform
+  /// `±jitterRatio` jitter.
+  ///
+  /// `weakNetwork` deliberately polls on the slow cadence. It is a
+  /// SUCCESSFUL probe — the request completed, the server replied, the
+  /// connection works and is merely slow — so there is no outage to
+  /// recover from and nothing that a 1-minute re-probe would learn sooner
+  /// in a way the user could act on. The fast cadence costs ~1440
+  /// requests/day sustained, plus a radio wakeup each, on exactly the
+  /// connections least able to spare either. Recovery is still picked up
+  /// within one [healthyInterval].
   Duration _nextDelay(ConnectionHealthState state) {
-    final base = state == ConnectionHealthState.healthy
-        ? healthyInterval
-        : retryInterval;
+    final serverAnswered = state == ConnectionHealthState.healthy ||
+        state == ConnectionHealthState.weakNetwork;
+    final base = serverAnswered ? healthyInterval : retryInterval;
     if (jitterRatio == 0) return base;
     final jitterMs =
         (base.inMilliseconds * jitterRatio) * (_random.nextDouble() * 2 - 1);
