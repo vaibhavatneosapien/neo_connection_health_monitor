@@ -1,4 +1,4 @@
-/// The four states reported by [ConnectionHealthMonitor].
+/// The five states reported by [ConnectionHealthMonitor].
 ///
 /// Each maps 1:1 to a UI affordance. Keep [internetDisconnected] (user can
 /// act — fix WiFi) and [serverUnreachable] (user is stuck waiting on us)
@@ -19,6 +19,38 @@ enum ConnectionHealthState {
   /// status within the configured timeout. The device has working internet
   /// AND the server is reachable.
   healthy,
+
+  /// Emitted when the server probe SUCCEEDED but took longer than
+  /// `slowThreshold` to do so. The connection works; it is slow enough
+  /// that uploads will visibly lag.
+  ///
+  /// This is a latency verdict on one request, not a bandwidth
+  /// measurement. At the default `downConfirmationCount: 1` a single slow
+  /// probe on an otherwise fine network is enough to report it. That is
+  /// deliberate: the banner it drives is advisory ("your memory will sync
+  /// once the connection improves"), so a false positive costs the user
+  /// nothing, while a missed slow network leaves them staring at a stalled
+  /// upload with no explanation. Consumers that would rather wait for a
+  /// consistent story can raise `downConfirmationCount`, which applies to
+  /// this state like any other non-`healthy` one.
+  ///
+  /// Polled at `healthyInterval`, NOT `retryInterval` — the probe
+  /// succeeded, so there is no outage to recover from. Re-checking a
+  /// working-but-slow link five times as often would sustain ~1440
+  /// requests a day, and the radio wakeups with them, on exactly the
+  /// connections least able to spare either. Recovery is noticed within
+  /// one `healthyInterval`, which is soon enough for an advisory banner.
+  ///
+  /// Because the probe SUCCEEDED, this state does not count as "something
+  /// degraded is on screen" for the confirmation gate's generic-failure
+  /// rule — it belongs semantically with [healthy] despite sitting among
+  /// the failure values here. A link that degrades out of `weakNetwork`
+  /// into alternating failure modes can therefore still confirm one.
+  /// Without that exemption the gate locks open and the advisory banner
+  /// below stays on screen while the device is fully offline.
+  ///
+  /// UI hint: "Weak Network" — no action available, capture continues.
+  weakNetwork,
 
   /// Emitted when the server probe failed AND the generic internet probe
   /// (Cloudflare / Apple captive / Google CDN — see

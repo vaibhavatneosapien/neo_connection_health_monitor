@@ -12,3 +12,5 @@ pubspec.lock
 # linear-parallel-subagents coordination state
 .subagent-state/
 .worktrees/
+# macOS
+.DS_Store

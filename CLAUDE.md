@@ -46,7 +46,7 @@ Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
 - **Cloudflare is in front** (`server: cloudflare`, HTTP/2). §4's "Cloudflare bot challenge / 3xx" rationale describes a real proxy in the path, not a what-if.
 - **`cf-cache-status: DYNAMIC`** — uncached, which is required. A CDN-cached health response is worse than none: it reports a stale `healthy` while the server is down. Re-verify this if anyone adds cache rules for `*.neosapien.xyz`.
 - **~240 ms latency** — the 8 s default `requestTimeout` has ample headroom.
-- **`{"status": "ok"}` is a static literal** — liveness, not readiness; it touches no datastore. This is what we want (see `docs/solutions/architecture-patterns/health-endpoint-liveness-vs-readiness.md`), with one known consequence: backend up + database down still returns 200 → package emits `healthy` → no banner while the app is broken. Covering that is the future `degraded` state (§Out of scope), which needs a real dependency-check body.
+- **`{"status": "ok"}` is a static literal** — liveness, not readiness; it touches no datastore. This is what we want (see `docs/solutions/architecture-patterns/health-endpoint-liveness-vs-readiness.md`), with one known consequence: backend up + database down still returns 200 → package emits `healthy` → no banner while the app is broken. Covering that is the future `serverDegraded` state (§Out of scope), which needs a real dependency-check body.
 
 ## Tech
 
@@ -59,9 +59,10 @@ Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
 | Package | Why | Notes |
 |---|---|---|
 | `http` | Lightweight server health request. Use **`GET`** (see below). | Use `http.Client` so it can be injected for tests. |
+| `clock` | Measures probe round-trip time for the `weakNetwork` verdict. | Use `clock.now()`, **not `Stopwatch`** — `fake_async` installs a fake `Clock` but leaves `Stopwatch` on the real wall clock, so a stopwatch reads ~0 in every test regardless of elapsed virtual time. Pure Dart, maintained by the Dart team. |
 | `internet_connection_checker_plus` | HTTP-level check that device actually has internet (not just WiFi attached to a captive portal). | **Required** over the original `internet_connection_checker` — the original pulls `flutter` + `connectivity_plus` as deps, which breaks the pure-Dart goal. `_plus` depends only on `http`. Pin `^3.0.0` and read the v3 migration guide before bumping. Override the default endpoint list (`one.one.one.one`, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com`) if corp firewalls block any of them. This kind of dependency archaeology prevents pain later — do not "simplify" back to the original package. |
 
-**HTTP method: `GET`, not `HEAD`.** Many backend frameworks return `405 Method Not Allowed` for `HEAD` on routes declared only as `GET` — silent breakage that the package would currently treat as `serverUnreachable`. `GET` is universally supported and lets us read the response body later (e.g. a future `{"status":"degraded"}` payload that could drive a `degraded` state without an API break).
+**HTTP method: `GET`, not `HEAD`.** Many backend frameworks return `405 Method Not Allowed` for `HEAD` on routes declared only as `GET` — silent breakage that the package would currently treat as `serverUnreachable`. `GET` is universally supported and lets us read the response body later (e.g. a future `{"status":"degraded"}` payload that could drive a `serverDegraded` state without an API break).
 
 **Confirmed against the real backend 2026-07-16, not just predicted.** `/healthz` is declared `@app.get` and `HEAD https://neo-backend-v2.dev-api.neosapien.xyz/healthz` returns `405` live, while `GET` returns `200 {"status":"ok"}` (15-byte JSON body). Had this package shipped `HEAD`, it would have reported `serverUnreachable` permanently against a healthy server. See §Project → Backend endpoint.
 
@@ -77,13 +78,18 @@ Do **not** add Flutter as a dependency.
 ```dart
 enum ConnectionHealthState {
   initial,              // before first check completes; starting sentinel
-  healthy,              // server /health returned 2xx
+  healthy,              // server /health returned 2xx within slowThreshold
+  weakNetwork,          // server /health returned 2xx but took > slowThreshold
   internetDisconnected, // server unreachable AND generic internet probe also failed
   serverUnreachable,    // server failed but generic internet probe succeeded
 }
 ```
 
-Four states are intentional — UI needs to distinguish "check your WiFi" (`internetDisconnected`, user can act) from "our servers are down" (`serverUnreachable`, user is stuck waiting). Do not collapse them. They drive different UI affordances and copy, and conflating them produces a worse product.
+The distinct states are intentional — UI needs to distinguish "check your WiFi" (`internetDisconnected`, user can act) from "our servers are down" (`serverUnreachable`, user is stuck waiting). Do not collapse them. They drive different UI affordances and copy, and conflating them produces a worse product.
+
+`weakNetwork` is a **latency verdict on a successful probe**, not a failure — it reports a connection that works but is slow enough for uploads to visibly lag. Note it is NOT the `serverDegraded` state reserved in §Out of scope: that one is a *backend*-reported condition read from the response body (`{"status":"degraded"}`), whereas `weakNetwork` is measured client-side from round-trip time. Both may eventually exist; do not conflate the terms, and note the reserved name carries a `server` prefix precisely so they cannot be confused — see §Out of scope for why.
+
+**Adding an enum value is a breaking change** for consumers with exhaustive `switch` statements. Bump the version and write a CHANGELOG entry when you do.
 
 ### 2. `ConnectionHealthMonitor` service (`lib/src/connection_health_monitor.dart`)
 
@@ -97,6 +103,17 @@ class ConnectionHealthMonitor {
     Duration healthyInterval = const Duration(minutes: 5),
     Duration retryInterval = const Duration(minutes: 1),
     Duration requestTimeout = const Duration(seconds: 8),
+    Duration slowThreshold = const Duration(seconds: 3),
+                                             // 2xx slower than this -> weakNetwork.
+                                             // Must be in (0, requestTimeout);
+                                             // throws ArgumentError otherwise.
+    int downConfirmationCount = 1,           // consecutive degraded observations
+                                             // required before emitting: N of the
+                                             // SAME state, or N of any kind while
+                                             // nothing degraded is reported yet
+                                             // (else an alternating link reports
+                                             // nothing, forever).
+                                             // 1 = historical behaviour.
     double jitterRatio = 0.1,                // ±10% jitter on scheduled delays
     http.Client? httpClient,                 // inject for tests
     InternetConnection? internetChecker,     // inject for tests
@@ -125,7 +142,11 @@ class ConnectionHealthMonitor {
 loop():
   state = await _runCheck()
   _emitIfChanged(state)
-  base   = state == healthy ? healthyInterval : retryInterval
+  // healthyInterval when the server ANSWERED (healthy or weakNetwork),
+  // retryInterval when the probe FAILED. weakNetwork is a successful
+  // probe — no outage to recover from — so it does not earn the fast
+  // cadence; see §1 and CHANGELOG 0.2.0.
+  base   = serverAnswered(state) ? healthyInterval : retryInterval
   jitter = (base * jitterRatio) * (random.nextDouble() * 2 - 1)   // ±jitterRatio
   delay  = Duration(milliseconds: base.inMilliseconds + jitter.toInt())
   _pendingTimer = Timer(delay, loop)   // store handle so stop()/dispose() can cancel
@@ -171,7 +192,7 @@ Rules:
 - **Server first.** Use `http.Request` (not `httpClient.get`) so `followRedirects = false` can be set. Treat any 3xx as `serverUnreachable` (handled by the disambiguation block — 3xx is not 2xx, so it falls through). Rationale: Cloudflare is confirmed in front of the real endpoint (§Project → Backend endpoint), so if `/healthz` ends up behind a bot challenge or a 301 to a migrated host (common during domain migrations), the "2xx = healthy" rule would silently break. Better to explicitly fail and let ops notice.
 - Treat any non-2xx, timeout, or thrown exception from the HTTP call as a failure that triggers the internet-check tiebreaker.
 - Do not retry inside `_runCheck()` — the loop already retries on the 1-minute cadence. Retrying here doubles request rate without improving outcomes.
-- Read and discard the response body to free the connection back to the pool. Do not parse the body in v1 (future `degraded` state will).
+- Read and discard the response body to free the connection back to the pool. Do not parse the body in v1 (future `serverDegraded` state will).
 
 ### 5. Stream behavior
 
@@ -183,7 +204,9 @@ Rules:
 
 ### 6. `checkNow()` semantics — Option B: pure probe
 
-`checkNow()` returns `Future<ConnectionHealthState>` and **does NOT emit on the stream**. It is a pure probe used by retry buttons that await the result locally. It DOES update `currentState` and reset the scheduled timer so the next polling delay is measured from `checkNow()`'s completion (cancel `_pendingTimer`, schedule a new one at the appropriate interval after the probe completes).
+`checkNow()` returns `Future<ConnectionHealthState>` and **does NOT emit on the stream**. It is a pure probe used by retry buttons that await the result locally. It resets the scheduled timer so the next polling delay is measured from `checkNow()`'s completion (cancel `_pendingTimer`, schedule a new one at the appropriate interval after the probe completes).
+
+**It does NOT move `currentState` either** (changed in 0.2.0 — earlier revisions of this document said it did). `currentState` is replayed to late subscribers, so it must only ever hold a value the stream actually emitted; letting a pure probe advance it would let the two disagree. `checkNow()` likewise does not advance the `downConfirmationCount` streak. Practical consequence for consumers: a retry that succeeds does not itself clear a banner driven by `stream` — act on the returned value, or wait for the next scheduled tick.
 
 Two options were considered:
 - **Option A (rejected):** `checkNow()` returns `Future<void>`, all observation flows through the stream. Simpler mental model — one source of truth — but the retry-button use case wants the result locally to drive a button spinner / toast, so consumers would have to subscribe to the stream and await an event matching the call, which is awkward.
@@ -273,6 +296,8 @@ docs/
   solutions/                              # documented solutions to past problems (bugs, decisions, patterns), by category, with YAML frontmatter (module, tags, problem_type); relevant when implementing or debugging in documented areas
 ```
 
+`CONCEPTS.md` at the repo root holds the shared domain vocabulary — the terms with project-specific meaning (`Observation` vs `Reported state`, the confirmation gate's two rules, blip protection). Relevant when orienting to the state machine or discussing these concepts; the distinctions it records are ones this package has gotten wrong before.
+
 Rename existing `lib/src/neo_connection_health_base.dart` once real files exist — don't keep the placeholder.
 
 **Barrel exports.** `lib/neo_connection_health.dart` MUST export both `ConnectionHealthMonitor` AND `ConnectionHealthState`. If only the class is exported, consumers cannot pattern-match on the enum without importing `src/`, which leaks implementation paths and is fragile across refactors. Easy to forget; the barrel file must contain both `export 'src/connection_health_monitor.dart';` and `export 'src/connection_health_state.dart';`.
@@ -320,7 +345,9 @@ Required cases (the original plan listed 7; review added 8–14):
 - Multiple base URLs / multi-endpoint health aggregation.
 - Exponential backoff — spec is a flat 1-min retry (with ±10% jitter); don't second-guess it. Adding backoff invites scope creep and changes the semantics consumers expect.
 - Logging frameworks — leave logging to the consumer app. The package can accept an optional `void Function(Object)` log callback in a future revision if needed, but no framework dependency.
-- A `degraded` state in v1. The body-parse path for `{"status": "degraded"}` is a future revision; the `GET` choice (§Tech) keeps that door open without an API break.
+- A `serverDegraded` state in v1. The body-parse path for `{"status": "degraded"}` is a future revision; the `GET` choice (§Tech) keeps that door open without an API break.
+
+  **The reserved name is `serverDegraded`, not `degraded`** — decided 2026-07-19, and the decision is the whole point. A bare `degraded` sits one synonym away from the shipped `weakNetwork`, and the two mean opposite things about who is at fault: `weakNetwork` is measured *client-side* from round-trip time (your link is slow, the server is fine), `serverDegraded` is *server-reported* from the response body (the link is fine, the backend is sick). Names that close together get merged by a well-meaning refactor, and the merge is silent — both are "sort of working", so no test fails. The `server` prefix costs one word today and makes the collision unavailable forever. It also matches the existing `serverUnreachable`, which already carries the same prefix for the same reason.
 
 ## Decisions worth NOT re-litigating
 
