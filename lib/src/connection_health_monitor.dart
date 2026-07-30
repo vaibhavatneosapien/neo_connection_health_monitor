@@ -489,7 +489,7 @@ class ConnectionHealthMonitor {
   /// Issues `GET _uri` (redirects disabled) and reports whether the
   /// server responded 2xx. Wrapped in `requestTimeout` by the caller.
   /// Drains the body so the pooled connection is reusable (a future
-  /// `degraded` state would parse it here instead).
+  /// `serverDegraded` state would parse it here instead).
   // ponytail: drain isn't cancelled on timeout; a hung body keeps the
   // subscription alive until the transport's idle timeout (~60s, under the
   // retry cadence) reclaims it — self-limiting, not a leak. Upgrade to a

@@ -30,22 +30,22 @@ Consumers MUST pass `healthPath: '/healthz'`. The package default stays `/health
 
 Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
 
-| Env | Base URL | `/healthz` (probed 2026-07-16) |
+| Env | Base URL | `/healthz` (re-probed 2026-07-30) |
 |---|---|---|
 | dev | `https://neo-backend-v2.dev-api.neosapien.xyz` | **200** `{"status":"ok"}` |
-| prod | `https://neo-backend-v2.api.neosapien.xyz` | 404 — not yet deployed (see below) |
+| prod | `https://neo-backend-v2.api.neosapien.xyz` | **200** `{"status":"ok"}` — live since somewhere between 2026-07-16 and 2026-07-30 |
 
 `https://api.neosapien.xyz` is the **bare gateway host, not neo-backend-v2** (`neo-backend-v2/auth/principal_resolver.py:17`). It answers `200` on `/` but `404` on `/healthz`. Earlier revisions of this document used it as the example base URL; that was wrong. Do not reintroduce it.
 
-**Prod is not live yet.** Commit `2ae0314a feat: add /healthz endpoint` sits on `origin/dev` only. `neo-backend-v2/.github/workflows/deploy.yaml:67-69` maps `main`→prod, `stg`→stg, `dev`→dev, so the route needs promoting `dev` → `stg` → `main` before the package can point at prod. Until then, a prod-configured monitor reports a permanent `serverUnreachable`.
+**Prod is live now.** It was not on 2026-07-16 — commit `2ae0314a feat: add /healthz endpoint` sat on `origin/dev` only, and `neo-backend-v2/.github/workflows/deploy.yaml:67-69` maps `main`→prod, `stg`→stg, `dev`→dev, so the route needed promoting `dev` → `stg` → `main`. That promotion has happened: `GET https://neo-backend-v2.api.neosapien.xyz/healthz` returns `200 {"status":"ok"}` as of 2026-07-30. A prod-configured monitor no longer reports a permanent `serverUnreachable`.
 
-**What the live dev route confirms:**
+**What the live routes confirm** (both envs re-probed 2026-07-30):
 
-- **`HEAD /healthz` → `405`.** Direct live proof of the §Tech `GET`-not-`HEAD` mandate: the route is declared `@app.get`, so a `HEAD` probe would report `serverUnreachable` against a perfectly healthy server. This is no longer a hypothetical.
-- **No redirects, 0 hops** on the happy path — `followRedirects = false` (§4) stays quiet.
-- **Cloudflare is in front** (`server: cloudflare`, HTTP/2). §4's "Cloudflare bot challenge / 3xx" rationale describes a real proxy in the path, not a what-if.
-- **`cf-cache-status: DYNAMIC`** — uncached, which is required. A CDN-cached health response is worse than none: it reports a stale `healthy` while the server is down. Re-verify this if anyone adds cache rules for `*.neosapien.xyz`.
-- **~240 ms latency** — the 8 s default `requestTimeout` has ample headroom.
+- **`HEAD /healthz` → `405` on dev AND prod.** Direct live proof of the §Tech `GET`-not-`HEAD` mandate: the route is declared `@app.get`, so a `HEAD` probe would report `serverUnreachable` against a perfectly healthy server. This is no longer a hypothetical, and promoting to prod did not change it.
+- **No redirects, 0 hops** on the happy path, both envs — `followRedirects = false` (§4) stays quiet.
+- **Cloudflare is in front of dev, but not of prod.** Dev answers with `server: cloudflare` + `cf-ray` + `cf-cache-status: DYNAMIC`; prod returns none of those headers. §4's "Cloudflare bot challenge / 3xx" rationale still describes a real proxy in the dev path. Do not infer prod's edge from dev's headers — re-probe prod before reasoning about caching or challenges there.
+- **`cf-cache-status: DYNAMIC` on dev** — uncached, which is required. A CDN-cached health response is worse than none: it reports a stale `healthy` while the server is down. Re-verify this if anyone adds cache rules for `*.neosapien.xyz`, and re-check prod separately since it carries no cache-status header to read.
+- **~350 ms dev latency** — the 8 s default `requestTimeout` has ample headroom.
 - **`{"status": "ok"}` is a static literal** — liveness, not readiness; it touches no datastore. This is what we want (see `docs/solutions/architecture-patterns/health-endpoint-liveness-vs-readiness.md`), with one known consequence: backend up + database down still returns 200 → package emits `healthy` → no banner while the app is broken. Covering that is the future `serverDegraded` state (§Out of scope), which needs a real dependency-check body.
 
 ## Tech
@@ -89,6 +89,8 @@ The distinct states are intentional — UI needs to distinguish "check your WiFi
 
 `weakNetwork` is a **latency verdict on a successful probe**, not a failure — it reports a connection that works but is slow enough for uploads to visibly lag. Note it is NOT the `serverDegraded` state reserved in §Out of scope: that one is a *backend*-reported condition read from the response body (`{"status":"degraded"}`), whereas `weakNetwork` is measured client-side from round-trip time. Both may eventually exist; do not conflate the terms, and note the reserved name carries a `server` prefix precisely so they cannot be confused — see §Out of scope for why.
 
+**Because `weakNetwork` is a success, it is deliberately exempt from the confirmation gate's failure-run logic** (rule 2): it does not count toward a run of failures and does not suppress escalation to a real failure. Get this wrong and the gate locks open — a link degrading *out of* `weakNetwork` into alternating hard failures would never confirm a down state, leaving a false-reassuring banner on a broken device. This is the single most-repeated bug in this package's history (twice). The full rule is in `CONCEPTS.md` ("Weak network" + the confirmation-gate entries) and `docs/solutions/architecture-patterns/weaknetwork-disarms-confirmation-rule-2.md`; the exemption itself lives in `_isConfirmed` / the gate logic in `connection_health_monitor.dart`. Do not touch weakNetwork's relationship to `downConfirmationCount` without reading those first.
+
 **Adding an enum value is a breaking change** for consumers with exhaustive `switch` statements. Bump the version and write a CHANGELOG entry when you do.
 
 ### 2. `ConnectionHealthMonitor` service (`lib/src/connection_health_monitor.dart`)
@@ -107,13 +109,33 @@ class ConnectionHealthMonitor {
                                              // 2xx slower than this -> weakNetwork.
                                              // Must be in (0, requestTimeout);
                                              // throws ArgumentError otherwise.
+                                             // NOTE: 3 s is a bare default with NO
+                                             // field-data behind it (unlike the 8 s
+                                             // requestTimeout, which has a documented
+                                             // rationale). It is ~8x the ~350 ms healthy
+                                             // baseline — headroom that keeps a single
+                                             // sample tolerable. Do not tune it (or add
+                                             // an adaptive baseline) until the RTT
+                                             // distribution is measured — see the
+                                             // measurement backlog in the trigger-seam
+                                             // plan (KTD13 family).
     int downConfirmationCount = 1,           // consecutive degraded observations
                                              // required before emitting: N of the
                                              // SAME state, or N of any kind while
                                              // nothing degraded is reported yet
                                              // (else an alternating link reports
                                              // nothing, forever).
-                                             // 1 = historical behaviour.
+                                             // 1 = historical behaviour; 2 is the
+                                             // RECOMMENDED PRODUCTION VALUE (the
+                                             // Neosapien app ships 2). It is the
+                                             // hysteresis latch that damps a lone slow
+                                             // sample into weakNetwork — the same
+                                             // "N-in-a-row" pattern Envoy/HAProxy use,
+                                             // and the reason this package does NOT
+                                             // need EWMA/windowed smoothing (which would
+                                             // hold a 5-15 min stale value at this
+                                             // probe cadence). weakNetwork routes
+                                             // through this gate via _isConfirmed.
     double jitterRatio = 0.1,                // ±10% jitter on scheduled delays
     http.Client? httpClient,                 // inject for tests
     InternetConnection? internetChecker,     // inject for tests
@@ -193,6 +215,14 @@ Rules:
 - Treat any non-2xx, timeout, or thrown exception from the HTTP call as a failure that triggers the internet-check tiebreaker.
 - Do not retry inside `_runCheck()` — the loop already retries on the 1-minute cadence. Retrying here doubles request rate without improving outcomes.
 - Read and discard the response body to free the connection back to the pool. Do not parse the body in v1 (future `serverDegraded` state will).
+
+**Known limits of the dual-tier check.** The two-request disambiguation is right for the common cases (§4 rationale above), but it has two blind spots by construction. Both are accepted for v1 and documented here so they are not rediscovered as "bugs" during an incident:
+
+1. **False `serverUnreachable` on a whitelisting network (mirror of the case §4 fixes).** §4 inverted the check order to fix the false `internetDisconnected` that a CDN-blocking network produces. The mirror is not covered: a network that *permits* the internet-probe endpoints (`one.one.one.one`, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com` — Google/Apple/Cloudflare hosts, among the most commonly whitelisted on earth) but *blocks our host* makes the server probe fail while `hasInternetAccess` reports `true` → `serverUnreachable`. The banner then says "Server down" when our backend is healthy and the real fault is a firewall between this device and us. Same shape reaches the user from **our own misconfiguration**: a wrong `healthPath` returns `404` (or `HEAD` returns `405`, §Tech), and a `404` is currently indistinguishable from a real outage — both are non-2xx → `serverUnreachable`. Test case #13b pins this.
+   - **The discriminator is already in hand and thrown away.** `_runCheck` catches three distinct failure kinds — `TimeoutException`, `http.ClientException`, generic `Exception` (`connection_health_monitor.dart:458-469`) — and `_probeServer` computes the exact status code (`:500`) — then both discard everything except a single `bool`. An *HTTP response of any status* proves we reached the server (its fault); a *socket/TLS/timeout throw* proves the path was blocked before we got there (the network's fault). That difference separates "our server is sick" from "this network won't let you talk to us," and it costs nothing to retain.
+   - **Remedy (not v1):** do NOT add a fifth enum value — the user's action is identical to a real outage (wait, or switch networks), and it is a breaking change. Surface the failure kind (status code *or* exception type) through the optional diagnostic callback the trigger-seam plan already schedules (KTD13), whose signature must widen past `ConnectionHealthState` to carry it — see `docs/plans/2026-07-19-001-…-plan.md` KTD13. Cheapest honest fix meanwhile is **copy**: "Can't reach Neo servers" is true in both the real-outage and blocked-by-network cases, where "Server down" is an unprovable claim from the client. Needs a design call (Figma `5838-19485` currently says "Server down").
+
+2. **False `healthy` via TLS interception (iOS-MDM-only).** The happy path trusts any `2xx` as `healthy` without reading the body — the deliberate §Tech `GET`-not-`HEAD`/no-body-parse decision. Over HTTPS a captive portal *cannot* forge a `2xx`: without a device-trusted certificate for our host, interception surfaces as `HandshakeException`/`SocketException`/timeout (→ correctly `serverUnreachable`/`internetDisconnected`, not a fake `healthy`). The one exception is a **trusted MITM root already installed on the device**: an MDM-managed corporate proxy ("SSL inspection" — Zscaler, Palo Alto, etc.). On Android API 24+ apps ignore user/MDM-added CAs by default, so this fails closed there; on **iOS, MDM-installed roots are auto-trusted**, so a managed iOS device behind an SSL-inspecting proxy could receive a proxy-generated `2xx` (a block/login page) and read it as `healthy`. Narrow (managed iOS only), no proven mobile-app prevalence figure exists, and body-validation is not the fix (`/healthz` returns a static literal body — §Project — so there is nothing distinctive to validate, and zero of 12 surveyed industry health checkers default to body matching). Accepted for v1; recorded so a future `serverDegraded`/body-parse revision weighs it deliberately rather than inheriting it silently.
 
 ### 5. Stream behavior
 
@@ -323,6 +353,7 @@ Required cases (the original plan listed 7; review added 8–14):
 11. **`baseUrl` with trailing `/` + `healthPath` with leading `/` → no `//` in the request URL** (validates URL normalization in §2).
 12. **`initial` → `internetDisconnected` emits exactly one event** (validates de-dupe treats `initial` as a starting sentinel, §5).
 13. **Server returns 3xx redirect → treated as `serverUnreachable`** (validates `followRedirects = false` in §4).
+13b. **Server returns 4xx (internet up) → `serverUnreachable`** (pins the §4 "Known limits" mirror-case: a `404` from a misconfigured `healthPath` is indistinguishable from a real outage today).
 14. **Jitter test: with a seeded `Random`, 100 scheduled delays fall within ±10% of base interval** (validates §3).
 
 ## Conventions
@@ -390,8 +421,9 @@ monitor.start();
 monitor.stream.listen((state) {
   switch (state) {
     case ConnectionHealthState.healthy:             /* hide banner */
+    case ConnectionHealthState.weakNetwork:         /* "Weak Network" */
     case ConnectionHealthState.internetDisconnected:/* "Check your WiFi" */
-    case ConnectionHealthState.serverUnreachable:   /* "Our servers are down" */
+    case ConnectionHealthState.serverUnreachable:   /* "Server down" */
     case ConnectionHealthState.initial:             /* show nothing yet */
   }
 });

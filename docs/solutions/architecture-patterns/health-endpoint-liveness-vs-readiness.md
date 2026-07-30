@@ -124,7 +124,7 @@ async def healthz():
     )
 ```
 
-**Future-proofing without 503.** If a `degraded` UI state is ever wanted,
+**Future-proofing without 503.** If a `serverDegraded` UI state is ever wanted,
 do NOT reach for readiness. The package uses `GET` (not `HEAD`) specifically
 so the response body can carry richer signal later. Return **200 with a
 degraded body** and let the client decide how to render it — this keeps the
@@ -146,8 +146,11 @@ database down → `/healthz` still returns 200 → the package emits `healthy`
 → no banner, while the app is in fact broken.** That is the deliberate
 price of a stable, cheap, non-amplifying signal. The fix is *not* to flip
 this route to readiness (that reintroduces both failure modes above) — it
-is the future `degraded` state, which returns **200 with a degraded body**
-per the snippet above.
+is the future `serverDegraded` state, which returns **200 with a degraded
+body** per the snippet above. (The client-side state name carries the
+`server` prefix deliberately — see `CLAUDE.md` §Out of scope; the bare
+`degraded` here is the *backend's* response-body literal, which is a
+different thing and stays as written.)
 
 ## Related
 

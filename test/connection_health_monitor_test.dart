@@ -499,6 +499,31 @@ void main() {
     });
 
     // -------------------------------------------------------------------
+    // 13b: Server returns 4xx → serverUnreachable (internet up).
+    // Pins the mirror-case gap called out in CLAUDE.md §4 "Known limits":
+    // a 404 from a misconfigured `healthPath` is, today, indistinguishable
+    // from a real outage — both collapse to serverUnreachable. If a future
+    // change adds a misconfiguration signal (a diagnostic callback carrying
+    // the raw status), THIS test is the canary: the user-facing verdict must
+    // stay serverUnreachable while the new signal fires alongside it.
+    // -------------------------------------------------------------------
+    test('13b: server 404 → serverUnreachable (misconfig collapses to outage)',
+        () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('nope', 404)),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        expect(emissions, [ConnectionHealthState.serverUnreachable]);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
     // 14: Jitter — with a seeded Random, scheduled delays fall within
     // ±jitterRatio of the base interval.
     // -------------------------------------------------------------------

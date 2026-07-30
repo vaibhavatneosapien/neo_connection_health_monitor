@@ -37,7 +37,7 @@ monitor.stream.listen((state) {
     case ConnectionHealthState.healthy:             /* hide banner */
     case ConnectionHealthState.weakNetwork:         /* "Weak Network" */
     case ConnectionHealthState.internetDisconnected:/* "Check your WiFi" */
-    case ConnectionHealthState.serverUnreachable:   /* "Our servers are down" */
+    case ConnectionHealthState.serverUnreachable:   /* "Server down" */
     case ConnectionHealthState.initial:             /* show nothing yet */
   }
 });
@@ -59,10 +59,10 @@ await monitor.dispose();
 
 Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
 
-| Env | `baseUrl` | Status (probed 2026-07-16) |
+| Env | `baseUrl` | Status (probed 2026-07-30) |
 |---|---|---|
 | dev | `https://neo-backend-v2.dev-api.neosapien.xyz` | Live — `200 {"status":"ok"}` |
-| prod | `https://neo-backend-v2.api.neosapien.xyz` | Route not deployed yet |
+| prod | `https://neo-backend-v2.api.neosapien.xyz` | Live — `200 {"status":"ok"}` |
 
 `https://api.neosapien.xyz` is the bare gateway, **not** neo-backend-v2 — it 404s on `/healthz`. Don't point the monitor at it.
 
