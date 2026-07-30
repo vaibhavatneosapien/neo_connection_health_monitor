@@ -79,7 +79,7 @@ Do **not** add Flutter as a dependency.
 enum ConnectionHealthState {
   initial,              // before first check completes; starting sentinel
   healthy,              // server /health returned 2xx within slowThreshold
-  weakNetwork,          // server /health returned 2xx but took > slowThreshold
+  weakNetwork,          // slow 2xx AND the user's own internet is also slow
   internetDisconnected, // server unreachable AND generic internet probe also failed
   serverUnreachable,    // server failed but generic internet probe succeeded
 }
@@ -87,7 +87,7 @@ enum ConnectionHealthState {
 
 The distinct states are intentional — UI needs to distinguish "check your WiFi" (`internetDisconnected`, user can act) from "our servers are down" (`serverUnreachable`, user is stuck waiting). Do not collapse them. They drive different UI affordances and copy, and conflating them produces a worse product.
 
-`weakNetwork` is a **latency verdict on a successful probe**, not a failure — it reports a connection that works but is slow enough for uploads to visibly lag. Note it is NOT the `serverDegraded` state reserved in §Out of scope: that one is a *backend*-reported condition read from the response body (`{"status":"degraded"}`), whereas `weakNetwork` is measured client-side from round-trip time. Both may eventually exist; do not conflate the terms, and note the reserved name carries a `server` prefix precisely so they cannot be confused — see §Out of scope for why.
+`weakNetwork` is a **latency verdict on the user's own internet**, not a failure — it reports a connection that works but is slow enough for uploads to visibly lag. It is a **two-signal** verdict: a slow 2xx from our server is only a *trigger*; the monitor then times the user's real internet (the neutral-CDN probe) and reports `weakNetwork` only on positive evidence that link is slow, so a slow *backend* on a healthy link resolves to `healthy`, not `weakNetwork` (§4). Note it is NOT the `serverDegraded` state reserved in §Out of scope: that one is a *backend*-reported condition read from the response body (`{"status":"degraded"}`) — "the link is fine, the backend is sick", the mirror of `weakNetwork`'s "your link is slow, the server is fine". Both may eventually exist; do not conflate the terms, and note the reserved name carries a `server` prefix precisely so they cannot be confused — see §Out of scope for why.
 
 **Because `weakNetwork` is a success, it is deliberately exempt from the confirmation gate's failure-run logic** (rule 2): it does not count toward a run of failures and does not suppress escalation to a real failure. Get this wrong and the gate locks open — a link degrading *out of* `weakNetwork` into alternating hard failures would never confirm a down state, leaving a false-reassuring banner on a broken device. This is the single most-repeated bug in this package's history (twice). The full rule is in `CONCEPTS.md` ("Weak network" + the confirmation-gate entries) and `docs/solutions/architecture-patterns/weaknetwork-disarms-confirmation-rule-2.md`; the exemption itself lives in `_isConfirmed` / the gate logic in `connection_health_monitor.dart`. Do not touch weakNetwork's relationship to `downConfirmationCount` without reading those first.
 
@@ -106,17 +106,22 @@ class ConnectionHealthMonitor {
     Duration retryInterval = const Duration(minutes: 1),
     Duration requestTimeout = const Duration(seconds: 8),
     Duration slowThreshold = const Duration(seconds: 3),
-                                             // 2xx slower than this -> weakNetwork.
+                                             // Slow-path threshold, used TWICE: a 2xx
+                                             // slower than this TRIGGERS an internet
+                                             // re-check, and weakNetwork is reported
+                                             // only if the user's internet is ALSO
+                                             // slower than this (§4). A slow backend on
+                                             // a fast link stays healthy.
                                              // Must be in (0, requestTimeout);
                                              // throws ArgumentError otherwise.
                                              // NOTE: 3 s is a bare default with NO
                                              // field-data behind it (unlike the 8 s
                                              // requestTimeout, which has a documented
                                              // rationale). It is ~8x the ~350 ms healthy
-                                             // baseline — headroom that keeps a single
-                                             // sample tolerable. Do not tune it (or add
-                                             // an adaptive baseline) until the RTT
-                                             // distribution is measured — see the
+                                             // baseline — headroom that keeps the trigger
+                                             // from firing on normal latency. Do not tune
+                                             // it (or add an adaptive baseline) until the
+                                             // RTT distribution is measured — see the
                                              // measurement backlog in the trigger-seam
                                              // plan (KTD13 family).
     int downConfirmationCount = 1,           // consecutive degraded observations
@@ -224,7 +229,7 @@ Rules:
 
 2. **False `healthy` via TLS interception (iOS-MDM-only).** The happy path trusts any `2xx` as `healthy` without reading the body — the deliberate §Tech `GET`-not-`HEAD`/no-body-parse decision. Over HTTPS a captive portal *cannot* forge a `2xx`: without a device-trusted certificate for our host, interception surfaces as `HandshakeException`/`SocketException`/timeout (→ correctly `serverUnreachable`/`internetDisconnected`, not a fake `healthy`). The one exception is a **trusted MITM root already installed on the device**: an MDM-managed corporate proxy ("SSL inspection" — Zscaler, Palo Alto, etc.). On Android API 24+ apps ignore user/MDM-added CAs by default, so this fails closed there; on **iOS, MDM-installed roots are auto-trusted**, so a managed iOS device behind an SSL-inspecting proxy could receive a proxy-generated `2xx` (a block/login page) and read it as `healthy`. Narrow (managed iOS only), no proven mobile-app prevalence figure exists, and body-validation is not the fix (`/healthz` returns a static literal body — §Project — so there is nothing distinctive to validate, and zero of 12 surveyed industry health checkers default to body matching). Accepted for v1; recorded so a future `serverDegraded`/body-parse revision weighs it deliberately rather than inheriting it silently.
 
-3. **The slow path does NOT cross-check, so `weakNetwork` can mislabel a slow *backend* as a slow *network*.** The failure branch disambiguates (server-vs-network via `hasInternetAccess`, §4 above); the **success** branch does not — a `2xx` slower than `slowThreshold` returns `weakNetwork` immediately without any second probe (`_runCheck`: `connection_health_monitor.dart:471-475`, no `_internetChecker` call on this path). So if our backend process is itself slow — CPU-bound, event-loop-blocked — a slow `2xx` reads as `weakNetwork` ("your connection is weak") when the user's network is fine and the lag is ours. **Why this is a low-value edge, not a bug to rush-fix:** (a) `/healthz` is a static liveness literal that touches no datastore (~350ms, §Project), so backend think-time is ≈0 and a slow probe is almost always genuinely the network; (b) a cross-check has **nowhere to route** the answer — there is no "backend slow" state (`serverDegraded` is reserved, *body*-reported, not latency), and the user-facing symptom ("uploads will lag") is identical whether the slowness is network or backend, so the remedy is copy or a new enum value (breaking), not a second probe; (c) at the shipped `downConfirmationCount: 2` a one-off backend latency spike does not even surface — it must repeat. Do not add a neutral-host cross-check to the slow path speculatively; if this ever matters, it rides the same probe-RTT measurement and adaptive-threshold reservation as `slowThreshold` (measurement #4 in the trigger-seam plan). NOTE the asymmetry that is NOT a gap: `weakNetwork` is confirmed by the SAME gate as failures (`_isConfirmed`), and is in fact *stricter* — it is exempt from Rule 2's generic-failure shortcut (`:590-593`), so it can only confirm via a same-state run.
+3. **~~The slow path does NOT cross-check, so `weakNetwork` can mislabel a slow backend as a slow network.~~ RESOLVED (0.3.0).** The slow path now cross-checks. On a slow `2xx`, `_runCheck` no longer trusts the backend round trip alone — it times the user's real internet (the neutral-CDN probe via `_userInternetIsSlow`, `connection_health_monitor.dart`) and reports `weakNetwork` only on **positive evidence** the user's link is slow; a fast, blocked, unreachable, or errored internet check resolves to `healthy`. So a slow *backend* on a healthy link is now `healthy`, not a false "Weak Network". This matches the state's own definition (CONCEPTS.md: "your link slow, the server is fine") and needed no new enum value — the fix is a second probe on the rare slow-2xx path, and the happy path (fast 2xx) is still one request. See the plan doc `docs/plans/2026-07-30-001-feat-weak-internet-two-signal-plan.md`. NOTE the asymmetry that was NEVER a gap: `weakNetwork` is confirmed by the SAME gate as failures (`_isConfirmed`), and is in fact *stricter* — exempt from Rule 2's generic-failure shortcut (`:590-593`), so it can only confirm via a same-state run.
 
 ### 5. Stream behavior
 

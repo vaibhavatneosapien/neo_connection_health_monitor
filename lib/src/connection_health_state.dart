@@ -20,19 +20,29 @@ enum ConnectionHealthState {
   /// AND the server is reachable.
   healthy,
 
-  /// Emitted when the server probe SUCCEEDED but took longer than
-  /// `slowThreshold` to do so. The connection works; it is slow enough
-  /// that uploads will visibly lag.
+  /// Emitted when the server probe SUCCEEDED but slowly (round trip >
+  /// `slowThreshold`) AND a second probe confirms the user's OWN internet
+  /// is slow too. The connection works; it is slow enough that uploads
+  /// will visibly lag.
   ///
-  /// This is a latency verdict on one request, not a bandwidth
-  /// measurement. At the default `downConfirmationCount: 1` a single slow
-  /// probe on an otherwise fine network is enough to report it. That is
-  /// deliberate: the banner it drives is advisory ("your memory will sync
+  /// The two-signal check is deliberate. A slow round trip to our server
+  /// alone does not prove the user's link is weak — it could be our
+  /// backend having a slow moment, which is not the user's problem and not
+  /// what this state reports (a sick backend is the reserved
+  /// `serverDegraded`). So on a slow 2xx the monitor times the user's real
+  /// internet (the neutral CDN probe) and reports `weakNetwork` only on
+  /// POSITIVE evidence that link is slow; a fast, blocked, unreachable, or
+  /// errored internet check resolves to [healthy] instead — the user's
+  /// network is never blamed without proof. See CONCEPTS.md: "your link is
+  /// slow, the server is fine."
+  ///
+  /// This is a latency verdict, not a bandwidth measurement. At the default
+  /// `downConfirmationCount: 1` a single pair of slow probes is enough to
+  /// report it: the banner it drives is advisory ("your memory will sync
   /// once the connection improves"), so a false positive costs the user
-  /// nothing, while a missed slow network leaves them staring at a stalled
-  /// upload with no explanation. Consumers that would rather wait for a
-  /// consistent story can raise `downConfirmationCount`, which applies to
-  /// this state like any other non-`healthy` one.
+  /// nothing. Consumers that would rather wait for a consistent story can
+  /// raise `downConfirmationCount`, which applies to this state like any
+  /// other non-`healthy` one.
   ///
   /// Polled at `healthyInterval`, NOT `retryInterval` — the probe
   /// succeeded, so there is no outage to recover from. Re-checking a

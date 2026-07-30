@@ -23,7 +23,7 @@ The value a consumer actually receives: the most recent Observation that passed 
 Late subscribers are replayed the Reported state, so it must only ever hold a value that was genuinely delivered — a probe that bypasses the gate must not move it, or the two disagree.
 
 ### Weak network
-An Observation where the server answered, but slowly enough that the user will notice uploads lagging. It is a **success**, not a failure — the connection works. It sits among the failure values by enum position only, and treating it as a failure is the recurring mistake this package has made twice.
+An Observation that the **user's own internet** is slow enough that uploads will visibly lag — measured as a two-signal verdict, not from the backend round trip alone. A slow server response is only the *trigger*; the monitor then times the user's real internet (the neutral-CDN probe) and the Observation is `weakNetwork` only on positive evidence that link is slow (a slow *backend* on a fast link is a `healthy` Observation, not a weak one — see the plan `2026-07-30-001`). It is a **success**, not a failure — the connection works. It sits among the failure values by enum position only, and treating it as a failure is the recurring mistake this package has made twice.
 
 Because the probe succeeded, it does not count toward a run of failures and does not suppress escalation to a real failure.
 

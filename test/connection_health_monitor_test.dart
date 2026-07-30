@@ -20,9 +20,19 @@ import 'package:test/test.dart';
 /// Test double for `InternetConnection`. The `hasInternetAccess` getter is
 /// the only API the monitor uses; overriding it covers the surface.
 class _FakeInternetConnection extends InternetConnection {
-  _FakeInternetConnection({required this.online}) : super.createInstance();
+  _FakeInternetConnection({
+    required this.online,
+    this.responseDelay = Duration.zero,
+  }) : super.createInstance();
 
   bool online;
+
+  /// Simulated latency of the neutral-CDN reachability check. `weakNetwork`
+  /// now requires the USER's internet to be measurably slow (not merely the
+  /// backend), so a test that wants `weakNetwork` sets this above the
+  /// monitor's `slowThreshold`; the default of zero keeps every other test's
+  /// internet probe instant.
+  Duration responseDelay;
 
   /// Set true if the monitor ever calls [dispose] on this instance. Used to
   /// verify the monitor never disposes an INJECTED checker (only one it
@@ -30,7 +40,12 @@ class _FakeInternetConnection extends InternetConnection {
   bool disposed = false;
 
   @override
-  Future<bool> get hasInternetAccess async => online;
+  Future<bool> get hasInternetAccess async {
+    if (responseDelay > Duration.zero) {
+      await Future<void>.delayed(responseDelay);
+    }
+    return online;
+  }
 
   @override
   Future<void> dispose() async {
@@ -1003,7 +1018,12 @@ void main() {
             await Future<void>.delayed(const Duration(seconds: 4));
             return http.Response('ok', 200);
           }),
-          internetChecker: _FakeInternetConnection(online: true),
+          // Slow 2xx alone is no longer weakNetwork — the user's internet must
+          // also be slow. 4s > slowThreshold on both probes → weakNetwork.
+          internetChecker: _FakeInternetConnection(
+            online: true,
+            responseDelay: const Duration(seconds: 4),
+          ),
           slowThreshold: const Duration(seconds: 3),
           requestTimeout: const Duration(seconds: 8),
           healthyInterval: const Duration(minutes: 5),
@@ -1012,14 +1032,16 @@ void main() {
         monitor.stream.listen(emissions.add);
         monitor.start();
 
-        async.elapse(const Duration(seconds: 5));
+        // Backend probe (4s) then the internet-latency probe (4s) → the check
+        // completes at t=8s; elapse past that to observe the emission.
+        async.elapse(const Duration(seconds: 9));
         async.flushMicrotasks();
         expect(emissions, [ConnectionHealthState.weakNetwork]);
         expect(hits, 1);
 
         // healthyInterval (5 min) governs, not retryInterval (1 min). The
-        // delay is measured from the check's COMPLETION (t=4s), so the next
-        // probe lands at t=304s — we are at t=5s here.
+        // delay is measured from the check's COMPLETION (t=8s: backend 4s +
+        // internet 4s), so the next probe lands at t=308s — we are at t=9s.
         async.elapse(const Duration(minutes: 1));
         async.flushMicrotasks();
         expect(
@@ -1073,7 +1095,14 @@ void main() {
             await Future<void>.delayed(latency);
             return http.Response('ok', 200);
           }),
-          internetChecker: _FakeInternetConnection(online: true),
+          // Internet slow too, so the slow 2xx resolves to weakNetwork. When
+          // the backend recovers to 100ms below, the fast-2xx branch returns
+          // healthy without consulting the internet probe, so this delay does
+          // not affect the recovery phase.
+          internetChecker: _FakeInternetConnection(
+            online: true,
+            responseDelay: const Duration(seconds: 4),
+          ),
           slowThreshold: const Duration(seconds: 3),
           // weakNetwork reschedules on the healthy cadence, so this is the
           // interval that governs the re-probe below.
@@ -1082,7 +1111,8 @@ void main() {
         monitor.stream.listen(emissions.add);
         monitor.start();
 
-        async.elapse(const Duration(seconds: 5));
+        // backend 4s + internet 4s → weakNetwork lands at t=8s.
+        async.elapse(const Duration(seconds: 9));
         async.flushMicrotasks();
         expect(emissions, [ConnectionHealthState.weakNetwork]);
 
@@ -1094,6 +1124,72 @@ void main() {
           ConnectionHealthState.weakNetwork,
           ConnectionHealthState.healthy,
         ]);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 28b: slow 2xx but the user's internet is FAST → healthy. weakNetwork
+    // means "your link is slow, the server is fine" — a slow *backend* is
+    // our problem, not the user's, so it must NOT surface as weakNetwork.
+    // This is the whole point of the two-signal slow path.
+    // -------------------------------------------------------------------
+    test('28b: slow 200 + fast internet → healthy (backend slow is not weak)',
+        () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            await Future<void>.delayed(
+                const Duration(seconds: 4)); // slow backend
+            return http.Response('ok', 200);
+          }),
+          // Internet probe is instant → the user's link is fine.
+          internetChecker: _FakeInternetConnection(online: true),
+          slowThreshold: const Duration(seconds: 3),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.healthy],
+          reason: 'slow backend + fast link is ours to fix — not weakNetwork',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 28c: slow 2xx but the neutral CDN probes are unreachable (the
+    // whitelisting-network case: our host allowed, CDNs blocked) → healthy.
+    // A false/unreachable internet check is NOT positive evidence of a slow
+    // link, so the user's network is never blamed without proof.
+    // -------------------------------------------------------------------
+    test('28c: slow 200 + CDNs blocked → healthy (no proof link is slow)', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            await Future<void>.delayed(const Duration(seconds: 4));
+            return http.Response('ok', 200);
+          }),
+          // Backend reachable (2xx) but the neutral CDN probes fail.
+          internetChecker: _FakeInternetConnection(online: false),
+          slowThreshold: const Duration(seconds: 3),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.healthy],
+          reason: 'backend 2xx + CDNs blocked cannot prove a slow link',
+        );
         monitor.dispose();
       });
     });
@@ -1338,7 +1434,12 @@ void main() {
               await Future<void>.delayed(const Duration(seconds: 4));
               return http.Response('ok', 200);
             }),
-            internetChecker: _FakeInternetConnection(online: true),
+            // Both probes slow (4s > slowThreshold) so each check observes
+            // weakNetwork; each check now takes 8s (backend 4s + internet 4s).
+            internetChecker: _FakeInternetConnection(
+              online: true,
+              responseDelay: const Duration(seconds: 4),
+            ),
             slowThreshold: const Duration(seconds: 3),
             downConfirmationCount: 2,
             // weakNetwork reschedules on the HEALTHY cadence (the probe
@@ -1349,11 +1450,15 @@ void main() {
           monitor.stream.listen(emissions.add);
           monitor.start();
 
-          async.elapse(const Duration(seconds: 5));
+          // First check completes at t=8s: one weakNetwork observation, not
+          // yet confirmed at downConfirmationCount: 2.
+          async.elapse(const Duration(seconds: 9));
           async.flushMicrotasks();
           expect(emissions, isEmpty, reason: 'one slow response is not proof');
 
-          async.elapse(const Duration(seconds: 35));
+          // Next check fires at t=38s (t=8s + 30s), completes at t=46s → the
+          // second weakNetwork observation confirms it.
+          async.elapse(const Duration(seconds: 40));
           async.flushMicrotasks();
           expect(emissions, [ConnectionHealthState.weakNetwork]);
           monitor.dispose();
@@ -1518,7 +1623,15 @@ void main() {
         return (
           monitor: monitor,
           emissions: emissions,
-          setDelay: (d) => delay = d,
+          // A slow 2xx is weakNetwork only when the USER's internet is also
+          // slow, so couple the internet-probe latency to the HTTP latency:
+          // a slow-success step gets a slow internet probe (→ weakNetwork),
+          // and a fast failure step (delay 0) keeps the failure-path internet
+          // check instant, leaving the failure-phase timing unchanged.
+          setDelay: (d) {
+            delay = d;
+            checker.responseDelay = d;
+          },
           setStatus: (s) => status = s,
           setOnline: ({required bool online}) => checker.online = online,
         );
@@ -1531,12 +1644,14 @@ void main() {
           final h = gateHarness()..setDelay(const Duration(seconds: 4));
           h.monitor.start();
 
-          // Two slow-but-successful probes confirm weakNetwork (rule 1).
-          async.elapse(const Duration(seconds: 5));
+          // Two slow-but-successful probes confirm weakNetwork (rule 1). Each
+          // check now takes 8s (backend 4s + internet 4s): the first completes
+          // at t=8s, the second at t=46s (t=8s + 30s cadence + 8s).
+          async.elapse(const Duration(seconds: 9));
           async.flushMicrotasks();
           expect(h.emissions, isEmpty,
               reason: 'one slow response is not proof');
-          async.elapse(const Duration(seconds: 35));
+          async.elapse(const Duration(seconds: 40));
           async.flushMicrotasks();
           expect(h.emissions, [ConnectionHealthState.weakNetwork]);
 
@@ -1577,9 +1692,11 @@ void main() {
           final h = gateHarness()..setDelay(const Duration(seconds: 4));
           h.monitor.start();
 
-          async.elapse(const Duration(seconds: 5));
+          // Each slow check takes 8s (backend 4s + internet 4s); two of them
+          // confirm weakNetwork by t=46s.
+          async.elapse(const Duration(seconds: 9));
           async.flushMicrotasks();
-          async.elapse(const Duration(seconds: 35));
+          async.elapse(const Duration(seconds: 40));
           async.flushMicrotasks();
           expect(h.emissions, [ConnectionHealthState.weakNetwork]);
 
@@ -1614,7 +1731,9 @@ void main() {
           h
             ..setDelay(const Duration(seconds: 4))
             ..setStatus(200);
-          async.elapse(const Duration(seconds: 35));
+          // The slow 200 check now takes 8s (backend 4s + internet 4s): it
+          // fires at t=30s and completes at t=38s.
+          async.elapse(const Duration(seconds: 40));
           async.flushMicrotasks();
           expect(
             h.emissions,
@@ -1649,7 +1768,9 @@ void main() {
           // confirm on one observation.
           final h = gateHarness()..setDelay(const Duration(seconds: 4));
           h.monitor.start();
-          async.elapse(const Duration(seconds: 5));
+          // The slow check takes 8s (backend 4s + internet 4s); observe the
+          // unconfirmed weakNetwork after it completes at t=8s.
+          async.elapse(const Duration(seconds: 9));
           async.flushMicrotasks();
           expect(h.emissions, isEmpty, reason: 'one slow probe is unconfirmed');
 

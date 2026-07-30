@@ -433,17 +433,24 @@ class ConnectionHealthMonitor {
     });
   }
 
-  /// Server-first dual-tier check. On a 2xx response from the server
-  /// probe, returns `healthy` — or [ConnectionHealthState.weakNetwork] if
-  /// the round trip exceeded [slowThreshold]. Otherwise disambiguates: if
-  /// the generic internet probe also fails, the device is offline
-  /// ([ConnectionHealthState.internetDisconnected]); else the server is
-  /// the cause ([ConnectionHealthState.serverUnreachable]).
+  /// Server-first dual-tier check. On a fast 2xx from the server probe,
+  /// returns `healthy`. On a SLOW 2xx it does not trust the backend round
+  /// trip alone — a slow backend is not the user's problem
+  /// ([ConnectionHealthState.weakNetwork] means "your link is slow, the
+  /// server is fine"; a sick *backend* is the reserved `serverDegraded`,
+  /// §Out of scope, which we deliberately do not report). It times the
+  /// user's real internet (the neutral CDN probe) and reports
+  /// `weakNetwork` only on positive evidence that link is slow; otherwise
+  /// `healthy`. On a failed probe it disambiguates: if the generic internet
+  /// probe also fails the device is offline
+  /// ([ConnectionHealthState.internetDisconnected]); else the server is the
+  /// cause ([ConnectionHealthState.serverUnreachable]).
   ///
   /// Inverting the previous "internet probe first" order fixes the
   /// false-negative on corporate firewalls that whitelist the API host
-  /// but block public CDN probe endpoints, and is cheaper in the happy
-  /// path (one request, not two).
+  /// but block public CDN probe endpoints, and keeps the happy path (fast
+  /// 2xx) at ONE request — the second probe runs only on the rare slow 2xx
+  /// or the rare failure.
   Future<ConnectionHealthState> _runCheck() async {
     var serverOk = false;
     // `clock.now()` rather than `Stopwatch`: `fake_async` installs a fake
@@ -469,7 +476,17 @@ class ConnectionHealthMonitor {
     }
 
     if (serverOk) {
-      return clock.now().difference(startedAt) > slowThreshold
+      // Fast 2xx: the user's path to us is quick, so their link is fine.
+      // Happy path stays ONE request — no internet probe here.
+      if (clock.now().difference(startedAt) <= slowThreshold) {
+        return ConnectionHealthState.healthy;
+      }
+      // Slow 2xx. `weakNetwork` must mean the USER'S internet is slow, not
+      // that our backend had a slow moment (we don't report backend health
+      // client-side — that is the reserved `serverDegraded`). The backend
+      // round trip cannot tell the two apart, so measure the user's real
+      // internet and report `weakNetwork` only on positive proof it is slow.
+      return await _userInternetIsSlow()
           ? ConnectionHealthState.weakNetwork
           : ConnectionHealthState.healthy;
     }
@@ -484,6 +501,30 @@ class ConnectionHealthMonitor {
     return hasInternet
         ? ConnectionHealthState.serverUnreachable
         : ConnectionHealthState.internetDisconnected;
+  }
+
+  /// Whether the user's own internet is measurably slow — the positive
+  /// signal behind [ConnectionHealthState.weakNetwork].
+  ///
+  /// Times the injected neutral-CDN check. That check is non-strict, so it
+  /// returns as soon as the FASTEST reachable endpoint answers — its
+  /// duration is therefore best-case link latency, and if even that exceeds
+  /// [slowThreshold] the link genuinely is slow. Anything short of positive
+  /// evidence — a fast result, an unreachable/blocked result (`false`), a
+  /// transport error, or a timeout — returns `false`, so `weakNetwork` never
+  /// fires on a link we cannot PROVE is slow (e.g. a firewall that whitelists
+  /// our host but blocks the CDN probes: backend 2xx, CDNs unreachable → the
+  /// user's link is not blamed).
+  Future<bool> _userInternetIsSlow() async {
+    final startedAt = clock.now();
+    try {
+      final reachable =
+          await _internetChecker.hasInternetAccess.timeout(requestTimeout);
+      if (!reachable) return false;
+    } on Exception {
+      return false;
+    }
+    return clock.now().difference(startedAt) > slowThreshold;
   }
 
   /// Issues `GET _uri` (redirects disabled) and reports whether the

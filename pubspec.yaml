@@ -3,7 +3,7 @@ description: Pure Dart package that monitors device internet connectivity and a 
 # 0.2.0, not 0.1.1: `ConnectionHealthState` gained `weakNetwork`, which
 # breaks any consumer with an exhaustive switch. Under semver's 0.x rules
 # the minor is the breaking slot.
-version: 0.2.0
+version: 0.3.0
 # repository: https://github.com/my_org/my_repo
 
 environment:
