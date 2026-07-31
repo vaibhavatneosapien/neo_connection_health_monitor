@@ -3,8 +3,9 @@ description: Pure Dart package that monitors device internet connectivity and a 
 # 0.x minor is the breaking/behavior slot (see semver 0.x rules). 0.2.0 added
 # `weakNetwork`; 0.3.0 made it two-signal; 0.4.0 retires `serverUnreachable`
 # from production (server-down moved to the app's firebase channel) — a
-# behavior change with no source break, so it earns the minor.
-version: 0.4.0
+# behavior change with no source break, so it earns the minor. 0.4.1 is
+# release housekeeping (tag on master HEAD; no functional change over 0.4.0).
+version: 0.4.1
 # repository: https://github.com/my_org/my_repo
 
 environment:

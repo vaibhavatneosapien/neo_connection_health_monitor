@@ -4,6 +4,10 @@ All notable changes to `neo_connection_health` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+Release housekeeping — **no functional change over 0.4.0**. `v0.4.0` was tagged on the pre-merge feature commit; `v0.4.1` sits on `master` HEAD with the pubspec version matching the tag. Pin `v0.4.1` going forward.
+
 ## [0.4.0]
 
 Behaviour change (no source break — the enum and public API are unchanged, so consumer `switch`es still compile; a `serverUnreachable` arm just goes dead). The package **stops deciding "our backend is down."** That fact moves to the consumer app's existing firebase `system_banners` channel (ops-published). The package now owns client-link quality only.
