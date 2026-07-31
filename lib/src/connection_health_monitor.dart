@@ -40,14 +40,18 @@ class ConnectionHealthMonitor {
   /// - [healthPath] - defaults to `/health`. A leading `/` is added if
   ///   missing. **Neosapien consumers must pass `/healthz`** - the
   ///   backend serves `/healthz` and has no `/health` route on any
-  ///   environment, so the default would yield a permanent
-  ///   `serverUnreachable`. The default stays `/health` because it is
-  ///   the conventional choice for a reusable package.
+  ///   environment. Since 0.4.0 a wrong path no longer surfaces: a `404` is a
+  ///   server fault, and server faults with internet up now resolve to
+  ///   `healthy` (server-down is firebase-owned), so a misconfigured path
+  ///   fails **silent-green** rather than reporting `serverUnreachable`. The
+  ///   default stays `/health` because it is the conventional choice for a
+  ///   reusable package.
   /// - [healthyInterval] - delay between checks after the server
   ///   ANSWERED, i.e. `healthy` or `weakNetwork`. Default: 5 minutes.
   /// - [retryInterval] - delay between checks after the server probe
-  ///   FAILED, i.e. `internetDisconnected` or `serverUnreachable`.
-  ///   Default: 1 minute.
+  ///   FAILED with no internet, i.e. `internetDisconnected` (the only
+  ///   probe-reachable failure since `serverUnreachable` was retired in
+  ///   0.4.0). Default: 1 minute.
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
   ///   (chosen over 5 s for 3G on tier-2 networks).
   /// - [slowThreshold] - a probe that SUCCEEDS but takes longer than
@@ -135,7 +139,8 @@ class ConnectionHealthMonitor {
   final Duration healthyInterval;
 
   /// Delay between checks while the server probe is FAILING —
-  /// `internetDisconnected` or `serverUnreachable`.
+  /// `internetDisconnected` (the only probe-reachable failure since
+  /// `serverUnreachable` was retired in 0.4.0).
   final Duration retryInterval;
 
   /// Per-request timeout for the server `/health` probe.
@@ -443,8 +448,11 @@ class ConnectionHealthMonitor {
   /// `weakNetwork` only on positive evidence that link is slow; otherwise
   /// `healthy`. On a failed probe it disambiguates: if the generic internet
   /// probe also fails the device is offline
-  /// ([ConnectionHealthState.internetDisconnected]); else the server is the
-  /// cause ([ConnectionHealthState.serverUnreachable]).
+  /// ([ConnectionHealthState.internetDisconnected]); otherwise the link is fine
+  /// and the package reports `healthy`. It no longer judges the backend —
+  /// server-down moved to the app's firebase `system_banners` channel in 0.4.0
+  /// ([ConnectionHealthState.serverUnreachable] is retired but kept; see the
+  /// seam below and the decouple plan).
   ///
   /// Inverting the previous "internet probe first" order fixes the
   /// false-negative on corporate firewalls that whitelist the API host
@@ -498,9 +506,17 @@ class ConnectionHealthMonitor {
     } on Exception {
       hasInternet = false;
     }
-    return hasInternet
-        ? ConnectionHealthState.serverUnreachable
-        : ConnectionHealthState.internetDisconnected;
+    if (!hasInternet) return ConnectionHealthState.internetDisconnected;
+    // serverUnreachable is now owned by the app's firebase `system_banners`
+    // channel — see
+    // docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md.
+    // The package no longer judges the backend: with internet up, the only
+    // thing it still owns (the device's link) is fine, so it reports `healthy`.
+    // The enum value AND this return are kept (commented) so re-enabling the
+    // package as the server-down authority (Approach C) is a diff, not an
+    // archaeology dig. Retired in 0.4.0.
+    // return ConnectionHealthState.serverUnreachable;
+    return ConnectionHealthState.healthy;
   }
 
   /// Whether the user's own internet is measurably slow — the positive
