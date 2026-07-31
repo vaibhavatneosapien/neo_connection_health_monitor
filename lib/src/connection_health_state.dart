@@ -1,9 +1,10 @@
-/// The five states reported by [ConnectionHealthMonitor].
+/// The states of [ConnectionHealthMonitor].
 ///
-/// Each maps 1:1 to a UI affordance. Keep [internetDisconnected] (user can
-/// act — fix WiFi) and [serverUnreachable] (user is stuck waiting on us)
-/// distinct — do not collapse them into one "offline" state; they drive
-/// different UI copy.
+/// Four are emitted — [healthy], [weakNetwork], [internetDisconnected], and
+/// the [initial] sentinel. [serverUnreachable] is **reserved, not emitted
+/// since 0.4.0** (server-down moved to the app's firebase channel; see its
+/// member doc). Each emitted state maps 1:1 to a UI affordance; keep them
+/// distinct — they drive different UI copy.
 enum ConnectionHealthState {
   /// The state before the first health check completes. Acts as a
   /// starting sentinel so consumers can distinguish "not yet checked"
@@ -69,12 +70,17 @@ enum ConnectionHealthState {
   /// UI hint: "Check your WiFi / mobile data" — the user can act.
   internetDisconnected,
 
-  /// Emitted when the server probe failed BUT the generic internet probe
-  /// succeeded, indicating the device has internet but the configured
-  /// server is unreachable (timeout, 3xx redirect, 4xx, 5xx, or socket
-  /// error).
+  /// **Reserved — not emitted in production since 0.4.0.** Server-down moved
+  /// to the app's firebase `system_banners` channel (ops-published); the
+  /// package no longer judges the backend, so a server probe that fails while
+  /// the internet is up now reports [healthy] instead of this. The value is
+  /// kept (deleting it is a source break for exhaustive `switch`es) and the
+  /// producing branch is preserved commented in `_runCheck`, so re-enabling
+  /// the package as the server-down authority (Approach C) is a one-line diff.
+  /// See docs/plans/2026-07-31-…-decouple-server-unreachable-firebase-plan.md.
   ///
-  /// UI hint: "Our servers are temporarily unreachable" — the user is
-  /// stuck waiting; retry on a button press is the only useful action.
+  /// Historically: emitted when the server probe failed BUT the generic
+  /// internet probe succeeded (timeout, 3xx, 4xx, 5xx, or socket error while
+  /// online). UI hint was "Our servers are temporarily unreachable."
   serverUnreachable,
 }

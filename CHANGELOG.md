@@ -4,6 +4,29 @@ All notable changes to `neo_connection_health` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+Behaviour change (no source break — the enum and public API are unchanged, so consumer `switch`es still compile; a `serverUnreachable` arm just goes dead). The package **stops deciding "our backend is down."** That fact moves to the consumer app's existing firebase `system_banners` channel (ops-published). The package now owns client-link quality only.
+
+### Changed
+- **`serverUnreachable` is no longer emitted in production.** A server probe that fails while the internet is up now resolves to `healthy` instead of `serverUnreachable` — the package no longer judges the backend, and with the internet up the only thing it still owns (the device's link) is fine. The `!hasInternet` branch is unchanged: server-fail + internet-down is still `internetDisconnected`. The seam is one branch in `_runCheck` (`lib/src/connection_health_monitor.dart`). Rationale and the one-owner-per-concern decision: `docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md`.
+- **The `serverUnreachable` enum value and its producing return are kept, commented, not deleted.** Deleting the value is a source break (CLAUDE.md §1); the commented `return ConnectionHealthState.serverUnreachable` in `_runCheck` and the retained value keep re-enablement (Approach C — package becomes the server-down authority again) a one-line diff rather than an archaeology dig. Enum, `_runCheck`/`_nextDelay`, `retryInterval`, and `healthPath` dartdocs updated to describe the value as reserved/not-emitted since 0.4.0.
+
+### Known limits (accepted)
+- **Server-down is now ops-manual.** If nobody publishes a `system_banners` doc, a real outage shows **no banner** — automatic client detection is gone. The deliberate trade: no false positives, at the cost of no auto-detection. Revisit with Approach C or an automatic firebase uptime writer if the manual gap bites.
+- **Server faults now fail silent-`healthy`.** With internet up, a `404` from a wrong `healthPath`, a `5xx`, a `3xx`, or a timeout all resolve to `healthy`. A misconfigured probe URL no longer surfaces (before 0.4.0 it read as `serverUnreachable`, indistinguishable from a real outage; now it reads as `healthy`). The diagnostic-callback remedy is deferred (KTD13, trigger-seam plan). Documented so it is a decision, not a surprise.
+
+### Downstream (consumer app, follow-up — not this package)
+- The app's banner layer must decide priority when both sources fire. "For now" rule: package internet signals **override** the firebase server-down banner — `internetDisconnected` > `weakNetwork` > firebase "Server Down" > `healthy` (none). `internetDisconnected` outranking "Server Down" is correct (a user with no internet can only act on "check your WiFi"). Flag: `weakNetwork` outranking a genuine "Server Down" shows falsely-reassuring "will sync soon" copy while the backend is actually down — accepted as a "for now" simplification. See the plan's Downstream section.
+- `ConnectionHealthCubit`'s `serverUnreachable → serverDown` mapping and the `NetworkFailureTicker → checkNow` trigger (which existed only to catch `serverUnreachable` faster) become dead and should be commented out app-side.
+
+### Tests
+- Retargeted the tests that asserted an emitted `serverUnreachable` (14 across three buckets — the change reaches further than the server probe alone because `serverUnreachable` was the suite's only *second* failure mode). **Retargeted to `healthy`** (positive pins for the new behavior): #2 (500), #3 (timeout), #13 (3xx), #13b (404) — all with internet up. **Trigger swapped to `internetDisconnected`** (tests that only needed "a failure"; the failure leg now drops both the server and the internet): #5, #7b, #23, #43, #44. **Skipped and kept** (`skip:` with a pointer to the plan; they need two *distinct* probe-reachable failure modes, which no longer exist — un-skip with Approach C): #32, #32b, #33, #36, #41. #41 is the load-bearing weakNetwork/Rule-2 exemption guard, so skipping it is called out explicitly. Added #13c to pin `followRedirects = false` on the request directly, since #13 no longer distinguishes a 3xx from a 2xx at the state level. `internetDisconnected` / `weakNetwork` cases are unchanged.
+
+### Notes
+- Confirmation-gate **Rule 2** (alternation between two failure modes) is now unexercisable through the public surface — only `internetDisconnected` remains probe-reachable, and a run of the same state confirms via Rule 1. The Rule-2 logic in `_isConfirmed` is left intact and generic (dead-reachable only), so it revives the moment `serverUnreachable` returns.
+- No new dependency; the package stays pure-Dart (no firebase/Flutter).
+
 ## [0.3.0]
 
 Behaviour change (no source break — the enum and public API are unchanged, so consumer `switch`es still compile). `weakNetwork` now fires on **two** signals instead of one, so it is emitted in strictly fewer cases than in 0.2.0.

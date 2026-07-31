@@ -37,7 +37,7 @@ monitor.stream.listen((state) {
     case ConnectionHealthState.healthy:             /* hide banner */
     case ConnectionHealthState.weakNetwork:         /* "Weak Network" */
     case ConnectionHealthState.internetDisconnected:/* "Check your WiFi" */
-    case ConnectionHealthState.serverUnreachable:   /* "Server down" */
+    case ConnectionHealthState.serverUnreachable:   /* reserved — not emitted since 0.4.0; "Server down" now comes from your own firebase system_banners */
     case ConnectionHealthState.initial:             /* show nothing yet */
   }
 });
@@ -55,7 +55,7 @@ await monitor.dispose();
 
 ## Endpoint configuration (Neosapien)
 
-`healthPath` defaults to `/health` — the conventional default for a reusable package. **The Neosapien backend serves `/healthz`**, so the consumer app must pass `healthPath: '/healthz'`. There is no `/health` route on any environment; leaving the default in place yields a permanent `serverUnreachable`.
+`healthPath` defaults to `/health` — the conventional default for a reusable package. **The Neosapien backend serves `/healthz`**, so the consumer app must pass `healthPath: '/healthz'`. There is no `/health` route on any environment. **Since 0.4.0 a wrong path fails silently:** a `404` is a server fault, and server faults with internet up now report `healthy` (server-down is no longer judged here — see below), so a misconfigured `healthPath` shows green instead of an error. Verify the path yourself.
 
 Hosts follow `neo-backend-v2.<env->api.neosapien.xyz`:
 
@@ -119,9 +119,9 @@ monitor.start();
 | `healthy` | The configured health endpoint returned 2xx within `slowThreshold`. | Hide banner. |
 | `weakNetwork` | The health endpoint returned 2xx but took longer than `slowThreshold` (default 3 s). | "Weak network — sync will resume when the connection improves". |
 | `internetDisconnected` | Server unreachable AND the generic internet probe also failed. | "Check your WiFi / mobile data". |
-| `serverUnreachable` | Server failed but the generic internet probe succeeded. | "Our servers are temporarily unreachable". |
+| `serverUnreachable` | **Reserved — not emitted since 0.4.0.** Server-down moved to the consumer app's firebase `system_banners` channel; a server fault with internet up now reports `healthy`. Kept for source compatibility and re-enablement. | (not shown by this package) |
 
-The five states are intentional. UI needs to distinguish "fix your WiFi" (user can act) from "our servers are down" (user is stuck waiting) — do not collapse them.
+**Four states are emitted** (`healthy`, `weakNetwork`, `internetDisconnected`, plus the `initial` sentinel); `serverUnreachable` is reserved. The two live failure/degraded signals are intentional and distinct — `internetDisconnected` ("fix your WiFi", user can act) vs `weakNetwork` ("connection is slow") — do not collapse them. Server-down is the app's firebase banner, not this package (see 0.4.0 in the CHANGELOG).
 
 `weakNetwork` is a latency verdict on a single request, not a bandwidth measurement: at the default `downConfirmationCount: 1`, one slow probe on an otherwise healthy network reports it. That is deliberate — the banner it drives is advisory, so a false positive costs nothing, while a missed slow network leaves the user staring at a stalled upload with no explanation.
 

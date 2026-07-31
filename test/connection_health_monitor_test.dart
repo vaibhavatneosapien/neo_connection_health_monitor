@@ -132,9 +132,13 @@ void main() {
     });
 
     // -------------------------------------------------------------------
-    // 2: Internet up, server 500 → serverUnreachable.
+    // 2: Internet up, server 500 → healthy. Since 0.4.0 the package no longer
+    // judges the backend (server-down is firebase-owned), so a server fault
+    // with the internet up resolves to healthy. Positive pin for KTD1.
     // -------------------------------------------------------------------
-    test('2: server 500 → serverUnreachable', () {
+    test(
+        '2: server 500 + internet up → healthy (server-down is firebase-owned)',
+        () {
       fakeAsync((async) {
         final emissions = <ConnectionHealthState>[];
         final monitor = _build(
@@ -144,15 +148,16 @@ void main() {
         monitor.stream.listen(emissions.add);
         monitor.start();
         async.flushMicrotasks();
-        expect(emissions, [ConnectionHealthState.serverUnreachable]);
+        expect(emissions, [ConnectionHealthState.healthy]);
         monitor.dispose();
       });
     });
 
     // -------------------------------------------------------------------
-    // 3: Internet up, server timeout → serverUnreachable.
+    // 3: Internet up, server timeout → healthy. Timeout is a server fault;
+    // with the internet up it resolves to healthy since 0.4.0 (KTD1).
     // -------------------------------------------------------------------
-    test('3: server timeout → serverUnreachable', () {
+    test('3: server timeout + internet up → healthy', () {
       fakeAsync((async) {
         final emissions = <ConnectionHealthState>[];
         // Handler never completes; `.timeout(requestTimeout)` should fire.
@@ -167,7 +172,7 @@ void main() {
 
         async.elapse(const Duration(seconds: 4));
         async.flushMicrotasks();
-        expect(emissions, [ConnectionHealthState.serverUnreachable]);
+        expect(emissions, [ConnectionHealthState.healthy]);
         monitor.dispose();
       });
     });
@@ -205,15 +210,20 @@ void main() {
     });
 
     // -------------------------------------------------------------------
-    // 5: healthy → unhealthy → healthy emits exactly 3 events (de-dupe).
+    // 5: healthy → internetDisconnected → healthy emits exactly 3 events
+    // (de-dupe). internetDisconnected is the only surviving degraded
+    // transition since serverUnreachable was retired, so the failure leg
+    // drops BOTH the server (500) and the internet.
     // -------------------------------------------------------------------
-    test('5: healthy → unhealthy → healthy emits exactly 3 events', () {
+    test('5: healthy → internetDisconnected → healthy emits exactly 3 events',
+        () {
       fakeAsync((async) {
         final emissions = <ConnectionHealthState>[];
         var statusCode = 200;
+        final checker = _FakeInternetConnection(online: true);
         final monitor = _build(
           httpClient: MockClient((_) async => http.Response('', statusCode)),
-          internetChecker: _FakeInternetConnection(online: true),
+          internetChecker: checker,
           healthyInterval: const Duration(seconds: 10),
           retryInterval: const Duration(seconds: 5),
         );
@@ -222,22 +232,25 @@ void main() {
         async.flushMicrotasks();
         expect(emissions, [ConnectionHealthState.healthy]);
 
-        // Toggle to 500 → next loop tick should emit serverUnreachable.
+        // Server fails AND internet drops → next loop tick emits
+        // internetDisconnected.
         statusCode = 500;
+        checker.online = false;
         async.elapse(const Duration(seconds: 11));
         async.flushMicrotasks();
         expect(emissions, [
           ConnectionHealthState.healthy,
-          ConnectionHealthState.serverUnreachable,
+          ConnectionHealthState.internetDisconnected,
         ]);
 
-        // Toggle back to 200.
+        // Recover both.
         statusCode = 200;
+        checker.online = true;
         async.elapse(const Duration(seconds: 6));
         async.flushMicrotasks();
         expect(emissions, [
           ConnectionHealthState.healthy,
-          ConnectionHealthState.serverUnreachable,
+          ConnectionHealthState.internetDisconnected,
           ConnectionHealthState.healthy,
         ]);
 
@@ -331,10 +344,11 @@ void main() {
     test('7b: checkNow() does NOT emit even when state changes', () {
       fakeAsync((async) {
         var statusCode = 200;
+        final checker = _FakeInternetConnection(online: true);
         final emissions = <ConnectionHealthState>[];
         final monitor = _build(
           httpClient: MockClient((_) async => http.Response('', statusCode)),
-          internetChecker: _FakeInternetConnection(online: true),
+          internetChecker: checker,
           healthyInterval: const Duration(hours: 1),
         );
         monitor.stream.listen(emissions.add);
@@ -342,13 +356,15 @@ void main() {
         async.flushMicrotasks();
         expect(emissions, [ConnectionHealthState.healthy]);
 
-        // Toggle backend and probe via checkNow — currentState should
-        // change to serverUnreachable but the stream must NOT receive it.
+        // Force a real transition: server fails AND internet drops, so
+        // checkNow observes internetDisconnected (serverUnreachable retired).
+        // currentState should still NOT move — the stream must not receive it.
         statusCode = 500;
+        checker.online = false;
         ConnectionHealthState? probed;
         monitor.checkNow().then((s) => probed = s);
         async.flushMicrotasks();
-        expect(probed, ConnectionHealthState.serverUnreachable);
+        expect(probed, ConnectionHealthState.internetDisconnected);
         expect(
             emissions,
             [
@@ -489,10 +505,13 @@ void main() {
     });
 
     // -------------------------------------------------------------------
-    // 13: Server returns 3xx redirect → treated as serverUnreachable.
-    // (Validates followRedirects = false on the request.)
+    // 13: Server returns 3xx redirect + internet up → healthy. A 3xx is a
+    // non-2xx server fault; since 0.4.0 it resolves to healthy (KTD1).
+    // NOTE: this no longer PROVES followRedirects = false at the state level
+    // (3xx and 2xx now both → healthy on internet-up). The flag is still set
+    // in `_probeServer` — it just isn't observable via the emitted state.
     // -------------------------------------------------------------------
-    test('13: server 3xx → serverUnreachable', () {
+    test('13: server 3xx + internet up → healthy', () {
       fakeAsync((async) {
         final emissions = <ConnectionHealthState>[];
         final monitor = _build(
@@ -508,21 +527,23 @@ void main() {
         monitor.stream.listen(emissions.add);
         monitor.start();
         async.flushMicrotasks();
-        expect(emissions, [ConnectionHealthState.serverUnreachable]);
+        expect(emissions, [ConnectionHealthState.healthy]);
         monitor.dispose();
       });
     });
 
     // -------------------------------------------------------------------
-    // 13b: Server returns 4xx → serverUnreachable (internet up).
-    // Pins the mirror-case gap called out in CLAUDE.md §4 "Known limits":
-    // a 404 from a misconfigured `healthPath` is, today, indistinguishable
-    // from a real outage — both collapse to serverUnreachable. If a future
-    // change adds a misconfiguration signal (a diagnostic callback carrying
-    // the raw status), THIS test is the canary: the user-facing verdict must
-    // stay serverUnreachable while the new signal fires alongside it.
+    // 13b: Server returns 4xx + internet up → healthy. Canary for Known
+    // limit #2 (decouple plan): a 404 from a misconfigured `healthPath` now
+    // fails SILENT-GREEN rather than surfacing. Before 0.4.0 this reported
+    // serverUnreachable (indistinguishable from a real outage); now the
+    // package no longer judges the backend at all, so a wrong path reads as
+    // healthy. If a future misconfiguration signal (diagnostic callback) is
+    // added, it must fire ALONGSIDE this healthy verdict — this test pins that
+    // the user-facing state stays healthy meanwhile.
     // -------------------------------------------------------------------
-    test('13b: server 404 → serverUnreachable (misconfig collapses to outage)',
+    test(
+        '13b: server 404 + internet up → healthy (misconfig fails silent-green)',
         () {
       fakeAsync((async) {
         final emissions = <ConnectionHealthState>[];
@@ -533,7 +554,34 @@ void main() {
         monitor.stream.listen(emissions.add);
         monitor.start();
         async.flushMicrotasks();
-        expect(emissions, [ConnectionHealthState.serverUnreachable]);
+        expect(emissions, [ConnectionHealthState.healthy]);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 13c: the outgoing probe request disables redirect-following. Since
+    // 0.4.0 the emitted state no longer distinguishes a 3xx from a 2xx
+    // (both → healthy on internet-up, #13), so this pins followRedirects =
+    // false directly on the request — a regression flipping it to true (a
+    // Cloudflare bot-challenge or migration 301 silently followed) would
+    // otherwise pass unnoticed.
+    // -------------------------------------------------------------------
+    test('13c: probe request disables followRedirects', () {
+      fakeAsync((async) {
+        bool? followed;
+        final monitor = _build(
+          httpClient: MockClient((req) async {
+            followed = req.followRedirects;
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        expect(followed, isFalse,
+            reason:
+                'redirects must stay disabled independent of emitted state');
         monitor.dispose();
       });
     });
@@ -914,10 +962,11 @@ void main() {
     test('23: checkNow() cannot move currentState ahead of the stream', () {
       fakeAsync((async) {
         var statusCode = 200;
+        final checker = _FakeInternetConnection(online: true);
         final existing = <ConnectionHealthState>[];
         final monitor = _build(
           httpClient: MockClient((_) async => http.Response('', statusCode)),
-          internetChecker: _FakeInternetConnection(online: true),
+          internetChecker: checker,
           healthyInterval: const Duration(seconds: 10),
           retryInterval: const Duration(seconds: 5),
         );
@@ -926,7 +975,10 @@ void main() {
         async.flushMicrotasks();
         expect(existing, [ConnectionHealthState.healthy]);
 
+        // Server fails AND internet drops → the probe reads internetDisconnected
+        // (serverUnreachable retired), but checkNow must not surface it.
         statusCode = 500;
+        checker.online = false;
         monitor.checkNow();
         async.flushMicrotasks();
         expect(
@@ -949,11 +1001,11 @@ void main() {
         async.flushMicrotasks();
         expect(existing, [
           ConnectionHealthState.healthy,
-          ConnectionHealthState.serverUnreachable,
+          ConnectionHealthState.internetDisconnected,
         ]);
         expect(late, [
           ConnectionHealthState.healthy,
-          ConnectionHealthState.serverUnreachable,
+          ConnectionHealthState.internetDisconnected,
         ]);
         monitor.dispose();
       });
@@ -1333,7 +1385,11 @@ void main() {
           );
           h.monitor.dispose();
         });
-      });
+      },
+          skip: 'serverUnreachable retired in 0.4.0 (firebase owns '
+              'server-down); Rule 2 needs a second probe-reachable failure '
+              'mode. Un-skip with Approach C — see '
+              'docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md');
 
       // 32b: the other half of the contract. Once a degraded state IS on
       // screen, rule 2 switches off and the per-state run governs the
@@ -1376,7 +1432,11 @@ void main() {
           ]);
           h.monitor.dispose();
         });
-      });
+      },
+          skip: 'serverUnreachable retired in 0.4.0 (firebase owns '
+              'server-down); Rule 2 needs a second probe-reachable failure '
+              'mode. Un-skip with Approach C — see '
+              'docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md');
 
       test('33: each state confirms on its own run', () {
         fakeAsync((async) {
@@ -1400,7 +1460,11 @@ void main() {
           ]);
           h.monitor.dispose();
         });
-      });
+      },
+          skip: 'serverUnreachable retired in 0.4.0 (firebase owns '
+              'server-down); Rule 2 needs a second probe-reachable failure '
+              'mode. Un-skip with Approach C — see '
+              'docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md');
 
       test('34: recovery emits on the FIRST healthy probe, never delayed', () {
         fakeAsync((async) {
@@ -1493,7 +1557,12 @@ void main() {
           expect(late, [ConnectionHealthState.internetDisconnected]);
           h.monitor.dispose();
         });
-      });
+      },
+          skip: 'serverUnreachable retired in 0.4.0 (firebase owns '
+              'server-down); needs a second probe-reachable failure mode to '
+              'produce an unconfirmed DIFFERENT degraded state. Un-skip with '
+              'Approach C — see '
+              'docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md');
 
       test('37: an unconfirmed bad probe retries on the FAST cadence', () {
         fakeAsync((async) {
@@ -1685,7 +1754,12 @@ void main() {
           );
           h.monitor.dispose();
         });
-      });
+      },
+          skip: 'serverUnreachable retired in 0.4.0 (firebase owns '
+              'server-down); this is the load-bearing weakNetwork/Rule-2 '
+              'exemption guard and needs a second probe-reachable failure '
+              'mode to alternate. Un-skip with Approach C — see '
+              'docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md');
 
       test('42: leaving a rule-1 weakNetwork still needs a full run', () {
         fakeAsync((async) {
@@ -1722,15 +1796,23 @@ void main() {
           // weakNetwork reached through rule 2 rather than rule 1: one
           // failure, then one slow success, from a cold start. No other test
           // takes this route, and a fix applied to rule 1's exit alone
-          // leaves _degradedRun primed here.
-          final h = gateHarness()..setStatus(500);
+          // leaves _degradedRun primed here. The first failure is
+          // internetDisconnected (server 500 + internet down) since
+          // serverUnreachable was retired.
+          final h = gateHarness()
+            ..setStatus(500)
+            ..setOnline(online: false);
           h.monitor.start();
           async.flushMicrotasks();
           expect(h.emissions, isEmpty, reason: 'one failure is not proof');
 
+          // Slow success needs the internet BACK (weakNetwork requires the
+          // user's link reachable-but-slow), so restore online alongside the
+          // slow 200.
           h
             ..setDelay(const Duration(seconds: 4))
-            ..setStatus(200);
+            ..setStatus(200)
+            ..setOnline(online: true);
           // The slow 200 check now takes 8s (backend 4s + internet 4s): it
           // fires at t=30s and completes at t=38s.
           async.elapse(const Duration(seconds: 40));
@@ -1738,7 +1820,7 @@ void main() {
           expect(
             h.emissions,
             [ConnectionHealthState.weakNetwork],
-            reason: 'serverUnreachable then a slow 200 is two degraded '
+            reason: 'internetDisconnected then a slow 200 is two degraded '
                 'observations of any kind — rule 2 confirms the second',
           );
 
@@ -1774,9 +1856,12 @@ void main() {
           async.flushMicrotasks();
           expect(h.emissions, isEmpty, reason: 'one slow probe is unconfirmed');
 
+          // The single failure is internetDisconnected (server 500 + internet
+          // down) since serverUnreachable was retired.
           h
             ..setDelay(Duration.zero)
-            ..setStatus(500);
+            ..setStatus(500)
+            ..setOnline(online: false);
           async.elapse(const Duration(seconds: 31));
           async.flushMicrotasks();
           expect(
