@@ -502,7 +502,8 @@ class ConnectionHealthMonitor {
     // Server failed. Disambiguate via the generic internet probe.
     bool hasInternet;
     try {
-      hasInternet = await _internetChecker.hasInternetAccess;
+      hasInternet =
+          await _internetChecker.hasInternetAccess.timeout(requestTimeout);
     } on Exception {
       hasInternet = false;
     }
