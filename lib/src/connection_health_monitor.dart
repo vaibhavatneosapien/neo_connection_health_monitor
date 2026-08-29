@@ -430,12 +430,26 @@ class ConnectionHealthMonitor {
   /// (see [_generation]).
   Future<void> _loop(int gen) async {
     if (!_running || _disposed || gen != _generation) return;
-    final state = await _runCheck();
+    ConnectionHealthState? state;
+    try {
+      state = await _runCheck();
+    } on Object {
+      // Last-resort guard. `_runCheck` is expected to swallow every probe
+      // fault itself, but if anything ever escapes it, the poller must NOT
+      // die: a rejected `_loop` future stops rescheduling, freezing the last
+      // banner on screen until the app is backgrounded/resumed. Skip this
+      // tick's emit and fall through to reschedule.
+      // ponytail: swallowed without logging (the package takes no logger yet);
+      // route it to a log seam here if one is ever added.
+    }
     if (!_running || _disposed || gen != _generation) return;
-    _emitIfChanged(state);
-    _pendingTimer = Timer(_nextDelay(state), () {
-      unawaited(_loop(gen));
-    });
+    if (state != null) _emitIfChanged(state);
+    // On a thrown tick (state == null) retry soon rather than at the relaxed
+    // cadence — something is wrong and the next probe should confirm quickly.
+    _pendingTimer = Timer(
+      _nextDelay(state ?? ConnectionHealthState.internetDisconnected),
+      () => unawaited(_loop(gen)),
+    );
   }
 
   /// Server-first dual-tier check. On a fast 2xx from the server probe,
@@ -500,14 +514,28 @@ class ConnectionHealthMonitor {
     }
 
     // Server failed. Disambiguate via the generic internet probe.
-    bool hasInternet;
+    // `null` = the check could not be completed (threw), which is NOT the same
+    // as a clean `false`.
+    bool? hasInternet;
     try {
       hasInternet =
           await _internetChecker.hasInternetAccess.timeout(requestTimeout);
-    } on Exception {
-      hasInternet = false;
+    } on Object {
+      // `on Object`, not `on Exception`: the checker can throw a non-Exception
+      // `Error` (a null-deref inside the plugin on some platforms). An `Error`
+      // is not an `Exception`, so an `on Exception` clause would let it escape,
+      // rejecting the `_loop` future — which then never reschedules. The poller
+      // wedges and the last banner freezes on screen until the app is
+      // backgrounded/resumed. Swallow everything here so the check stays
+      // self-contained; `hasInternet` stays `null` = "could not determine".
+      hasInternet = null;
     }
-    if (!hasInternet) return ConnectionHealthState.internetDisconnected;
+    // Only a CLEAN `false` (endpoints reached, none answered) is proof the
+    // device is offline. A throw is inconclusive — and blaming the user's link
+    // without proof is exactly the false "check your WiFi" banner we must
+    // avoid — so an inconclusive check resolves to `healthy`, the same "no
+    // proof, don't blame the link" stance as `_userInternetIsSlow`.
+    if (hasInternet == false) return ConnectionHealthState.internetDisconnected;
     // serverUnreachable is now owned by the app's firebase `system_banners`
     // channel — see
     // docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md.
@@ -538,7 +566,10 @@ class ConnectionHealthMonitor {
       final reachable =
           await _internetChecker.hasInternetAccess.timeout(requestTimeout);
       if (!reachable) return false;
-    } on Exception {
+    } on Object {
+      // `on Object`, not `on Exception`: the checker can throw a non-Exception
+      // `Error` (null-deref inside the plugin on some platforms), which must
+      // not escape and wedge the poller. Inconclusive = not proven slow.
       return false;
     }
     return clock.now().difference(startedAt) > slowThreshold;

@@ -27,6 +27,11 @@ class _FakeInternetConnection extends InternetConnection {
 
   bool online;
 
+  /// When non-null, [hasInternetAccess] throws this instead of returning.
+  /// Used to reproduce the plugin throwing a non-`Exception` `Error` (a
+  /// null-deref on some platforms) — which `on Exception` would let escape.
+  Object? throwOnCheck;
+
   /// Simulated latency of the neutral-CDN reachability check. `weakNetwork`
   /// now requires the USER's internet to be measurably slow (not merely the
   /// backend), so a test that wants `weakNetwork` sets this above the
@@ -44,6 +49,7 @@ class _FakeInternetConnection extends InternetConnection {
     if (responseDelay > Duration.zero) {
       await Future<void>.delayed(responseDelay);
     }
+    if (throwOnCheck != null) throw throwOnCheck!;
     return online;
   }
 
@@ -54,6 +60,11 @@ class _FakeInternetConnection extends InternetConnection {
     // this fake never started.
   }
 }
+
+/// An `Error` — NOT an `Exception`. Mirrors the null-deref the internet
+/// checker plugin can throw on some platforms; an `on Exception` clause would
+/// fail to catch it, so it is the exact shape that used to wedge the poller.
+class _SimulatedNullError extends Error {}
 
 /// Builds a `ConnectionHealthMonitor` with all dependencies injected. All
 /// timers are deterministic when run inside `fakeAsync(...)`.
@@ -404,6 +415,64 @@ void main() {
           [ConnectionHealthState.healthy],
           reason: 'server probe succeeded — internet probe is irrelevant',
         );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8b: the internet checker throws a non-Exception Error (a plugin
+    // null-deref). It must NOT escape and wedge the poller, and a throw is
+    // inconclusive — not proof of offline — so it must clear the banner
+    // rather than freeze it. Regression for the "banner stuck until the app
+    // is backgrounded/resumed" report.
+    // -------------------------------------------------------------------
+    test(
+        '8b: internet checker throwing an Error does not wedge the poller '
+        'and does not show a false banner', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        var hits = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('down', 500);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 10),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // Genuinely offline first: server 500 + clean `false` → banner shows.
+        expect(emissions, [ConnectionHealthState.internetDisconnected]);
+        expect(hits, 1);
+
+        // Now the plugin starts throwing a non-Exception Error on every check.
+        checker.throwOnCheck = _SimulatedNullError();
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          hits,
+          2,
+          reason: 'the throw must not wedge the loop — it keeps polling',
+        );
+        expect(
+          emissions,
+          [
+            ConnectionHealthState.internetDisconnected,
+            ConnectionHealthState.healthy,
+          ],
+          reason: 'a check that THREW is inconclusive, not proof of offline; '
+              'it must clear the banner, never freeze it',
+        );
+
+        // And the poller is still alive on subsequent ticks.
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(hits, 3, reason: 'poller still scheduling after the throw');
+        expect(monitor.currentState, ConnectionHealthState.healthy);
         monitor.dispose();
       });
     });
