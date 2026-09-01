@@ -1,0 +1,21 @@
+# Automated Claude PR review via the org's shared workflow.
+# Source template: NeoSapien-xyz/shared-workflows/examples/pr-review.yml
+
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  claude-review:
+    uses: NeoSapien-xyz/shared-workflows/.github/workflows/claude-compound-review.yml@main
+    with:
+      review_file: docs/REVIEW.md     # optional; skipped automatically if absent
+    secrets: inherit                  # picks up the org-level CLAUDE_CODE_OAUTH_TOKEN
