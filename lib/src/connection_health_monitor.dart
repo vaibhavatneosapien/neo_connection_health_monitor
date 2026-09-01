@@ -415,29 +415,36 @@ class ConnectionHealthMonitor {
     // _runCheck that completes after this checkNow would overwrite the
     // timer scheduled below, resetting the schedule from the wrong point.
     final gen = ++_generation;
-    // `_runCheck` returns `null` on an inconclusive tick (internet check threw);
-    // report the last known state to the caller and use the retry cadence.
-    // The `on Object` guard mirrors `_loop`: without it, an `Error` escaping the
-    // server probe (which `_runCheck` deliberately does NOT catch) would reject
-    // this future AFTER `_pendingTimer` was already cancelled above — wedging
-    // the whole poller until the caller does stop()/start(). Assert in debug so
-    // a real programmer bug stays loud; fall back to the last known state and
-    // let the reschedule below run in release.
-    ConnectionHealthState state;
+    // `_runCheck` returns `null` when the internet check was inconclusive (it
+    // threw); the `on Object` guard additionally catches a non-Exception
+    // `Error` escaping the server probe (which `_runCheck` deliberately does
+    // NOT catch). In both cases the probe told us nothing new, so we report the
+    // last known state to the caller and — like `_loop` — reschedule on the
+    // RETRY cadence (something is wrong, re-probe soon), not the relaxed one.
+    //
+    // The guard prevents a RELEASE wedge: without it an escaped `Error` would
+    // reject this future after `_pendingTimer` was already cancelled above,
+    // stopping the poller until the caller does stop()/start(). In DEBUG the
+    // assert deliberately still fails loud (like `_loop`) so a real programmer
+    // bug is not swallowed — asserts are stripped in release, where the
+    // fall-through reschedule runs.
+    ConnectionHealthState? probed;
     try {
-      state = await _runCheck() ?? _currentState;
+      probed = await _runCheck();
     } on Object catch (e, st) {
       assert(
         e is Exception,
         'Non-Exception escaped _runCheck (likely a programmer bug): $e\n$st',
       );
-      state = _currentState;
+      probed = null;
     }
+    final state = probed ?? _currentState;
     if (_disposed) return state;
     if (_running && gen == _generation) {
-      _pendingTimer = Timer(_nextDelay(state), () {
-        unawaited(_loop(gen));
-      });
+      _pendingTimer = Timer(
+        _nextDelay(probed ?? ConnectionHealthState.internetDisconnected),
+        () => unawaited(_loop(gen)),
+      );
     }
     return state;
   }

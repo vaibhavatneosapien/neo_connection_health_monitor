@@ -582,9 +582,11 @@ void main() {
     // -------------------------------------------------------------------
     test('8f: checkNow() surfaces an escaped Error via assert in debug', () {
       fakeAsync((async) {
+        var serverThrows = true;
         final monitor = _build(
           httpClient: MockClient((_) async {
-            throw _SimulatedNullError();
+            if (serverThrows) throw _SimulatedNullError();
+            return http.Response('ok', 200);
           }),
           internetChecker: _FakeInternetConnection(online: true),
         );
@@ -601,6 +603,14 @@ void main() {
               'a non-Exception Error escaping the server probe must surface '
               'loudly in debug, not silently wedge checkNow',
         );
+
+        // Not permanently wedged: with the fault cleared, start() resumes the
+        // poller normally rather than throwing or staying frozen.
+        serverThrows = false;
+        expect(() => monitor.start(), returnsNormally);
+        async.flushMicrotasks();
+        expect(monitor.currentState, ConnectionHealthState.healthy);
+
         monitor.dispose();
       });
     });
@@ -636,6 +646,64 @@ void main() {
         async.elapse(const Duration(seconds: 11));
         async.flushMicrotasks();
         expect(hits, 3, reason: 'null ticks keep the retry cadence');
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8i: checkNow() with an INCONCLUSIVE probe (internet check throws)
+    // while currentState is healthy must reschedule on the RETRY cadence,
+    // not the (relaxed) healthy cadence — cadence parity between checkNow's
+    // reschedule and `_loop`'s. Distinct intervals make the difference
+    // observable.
+    // -------------------------------------------------------------------
+    test(
+        '8i: checkNow() inconclusive while healthy reschedules on retry '
+        'cadence, not healthy cadence', () {
+      fakeAsync((async) {
+        var hits = 0;
+        var statusCode = 200;
+        final checker = _FakeInternetConnection(online: true);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('', statusCode);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 300),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        expect(monitor.currentState, ConnectionHealthState.healthy);
+        final hitsAfterStart = hits;
+
+        // Server now fails AND the internet check is inconclusive (throws):
+        // checkNow's probe is null, so it falls back to the last known
+        // currentState (healthy) — but must schedule the NEXT probe at the
+        // retry cadence, not the healthy one.
+        statusCode = 500;
+        checker.throwOnCheck = _SimulatedNullError();
+        ConnectionHealthState? probed;
+        monitor.checkNow().then((s) => probed = s);
+        async.flushMicrotasks();
+        expect(hits, hitsAfterStart + 1, reason: 'checkNow ran a probe');
+        expect(
+          probed,
+          ConnectionHealthState.healthy,
+          reason: 'inconclusive checkNow returns last known currentState',
+        );
+
+        // If the reschedule wrongly used the healthy (300s) cadence, this
+        // 11s elapse would not trigger another probe.
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          hits,
+          hitsAfterStart + 2,
+          reason: 'inconclusive checkNow must reschedule at the RETRY '
+              'cadence (~10s), not the healthy cadence (~300s)',
+        );
         monitor.dispose();
       });
     });
