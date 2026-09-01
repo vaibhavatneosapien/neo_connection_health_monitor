@@ -32,6 +32,16 @@ Tag every finding:
   missing test coverage for changed behavior, N+1 queries or unbounded work.
 - **P3 (Low)** — naming, dead code, simplification opportunities, doc drift.
 
+**Merge action per level (for the automated reviewer as well as humans):** P0 and
+P1 block merge; P2 requires an explicit acknowledgement before merge; P3 is
+advisory. "Breaking API change without versioning" is P0 wherever it appears —
+a repo-specific rule that pins a breaking change lower is a mistake, not an
+override. When a rule below is stated as an absolute (a **P1** invariant), treat
+it as **default-block-unless-cited**: a PR may override it only by citing the
+approved exception in `CLAUDE.md` or `CHANGELOG.md` (e.g. the sanctioned
+`healthPath`/method choices below). With such a citation present, flag for a
+human rather than auto-blocking; without one, block.
+
 ## Correctness checklist
 
 - Verify the change matches the stated intent (PR title/description); flag
@@ -124,9 +134,12 @@ particular:
   Dart. `internet_connection_checker_plus` is the sanctioned choice for exactly
   this reason.
 - **`Error` vs `Exception` catches are deliberate, not interchangeable.** The
-  internet-check sites catch `on Object` on purpose — the plugin can throw a
-  non-`Exception` `Error` (a null-deref on some platforms) that `on Exception`
-  would miss, wedging the poller. The server-probe site catches `on Exception`
+  internet-check sites catch `on Object` on purpose — the plugin
+  (`internet_connection_checker_plus`, pinned in `pubspec.yaml`) can throw a
+  non-`Exception` `Error` (an observed null-deref on some platforms) that `on
+  Exception` would miss, wedging the poller. Revisit this catch width on any
+  plugin bump: if a version stops throwing raw `Error`s, narrowing it is
+  correct, not a violation. The server-probe site catches `on Exception`
   on purpose — a programmer-bug `Error` must propagate, not be misclassified as
   a probe failure. `_loop`'s last-resort guard asserts `e is Exception` so our
   own `Error`s stay loud in debug and are swallowed only in release. Flipping
@@ -150,11 +163,13 @@ particular:
   `downConfirmationCount`.
 - **`serverUnreachable` is retired (0.4.0), not deleted.** It is no longer
   emitted — a server probe that fails while the internet is up returns
-  `healthy`; server-down moved to the app's firebase channel. The enum value
-  and its producing `return` are kept commented for source compat / Approach-C
-  re-enablement. Removing the enum value is a breaking change (**P1** without a
-  version bump + CHANGELOG); re-emitting it in production is a scope change that
-  needs a decision, not a silent PR.
+  `healthy`; server-down moved to the app's firebase channel. The enum value is
+  kept (deleting it breaks exhaustive `switch`es) and its producing `return` is
+  preserved commented in `_runCheck` for Approach-C re-enablement. Removing the
+  enum value without a version bump + CHANGELOG is a breaking API change without
+  versioning — **P0** by the severity ladder. Re-emitting it in production is a
+  scope change to a retired decision — **P1**, and default-block-unless-cited: it
+  needs an explicit decision, never a silent PR.
 - **HTTP probe: `GET`, not `HEAD`; `followRedirects = false`.** The real
   backend declares `@app.get`, so `HEAD` returns `405` and any 3xx/4xx is
   treated as a failure. Switching to `HEAD` or enabling redirect-following is a
