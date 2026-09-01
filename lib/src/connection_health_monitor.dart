@@ -383,6 +383,11 @@ class ConnectionHealthMonitor {
   /// Performs a one-off health check immediately and returns the
   /// observed state.
   ///
+  /// When the check is inconclusive — the internet probe threw, so there is no
+  /// proof either way — this returns the last known [currentState] rather than
+  /// a freshly observed value (there is nothing new to report). So "returns the
+  /// observed state" holds except on that inconclusive path.
+  ///
   /// Pure probe: the returned [Future] is the ONLY delivery path. It does
   /// not emit on [stream] and does not move [currentState] — both continue
   /// to report the last state the polling loop confirmed. Use it from a
@@ -412,7 +417,22 @@ class ConnectionHealthMonitor {
     final gen = ++_generation;
     // `_runCheck` returns `null` on an inconclusive tick (internet check threw);
     // report the last known state to the caller and use the retry cadence.
-    final state = await _runCheck() ?? _currentState;
+    // The `on Object` guard mirrors `_loop`: without it, an `Error` escaping the
+    // server probe (which `_runCheck` deliberately does NOT catch) would reject
+    // this future AFTER `_pendingTimer` was already cancelled above — wedging
+    // the whole poller until the caller does stop()/start(). Assert in debug so
+    // a real programmer bug stays loud; fall back to the last known state and
+    // let the reschedule below run in release.
+    ConnectionHealthState state;
+    try {
+      state = await _runCheck() ?? _currentState;
+    } on Object catch (e, st) {
+      assert(
+        e is Exception,
+        'Non-Exception escaped _runCheck (likely a programmer bug): $e\n$st',
+      );
+      state = _currentState;
+    }
     if (_disposed) return state;
     if (_running && gen == _generation) {
       _pendingTimer = Timer(_nextDelay(state), () {
@@ -456,6 +476,15 @@ class ConnectionHealthMonitor {
     }
     if (!_running || _disposed || gen != _generation) return;
     if (state != null) _emitIfChanged(state);
+    // Accepted limitation (cold-start dead zone): a null tick is inconclusive,
+    // so it is skipped to keep a throw INVISIBLE — it must never advance the
+    // confirmation gate (that invisibility is load-bearing; see test 8c). The
+    // cost is that a device launched on a platform where the plugin throws on
+    // EVERY tick, while also offline, stays at `initial` with no banner: we
+    // cannot prove offline without a working checker, and guessing here would
+    // both blame the user's link without proof and let a throw drive
+    // confirmation. Narrow and unproven in the field; revisit only with data.
+    //
     // On a thrown tick (state == null) retry soon rather than at the relaxed
     // cadence — something is wrong and the next probe should confirm quickly.
     _pendingTimer = Timer(

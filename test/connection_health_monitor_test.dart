@@ -526,6 +526,121 @@ void main() {
     });
 
     // -------------------------------------------------------------------
+    // 8e: checkNow() on an inconclusive tick (internet check throws) returns
+    // the last known currentState, does NOT emit, and reschedules on the retry
+    // cadence — the `_runCheck() ?? _currentState` fallback.
+    // -------------------------------------------------------------------
+    test('8e: checkNow() inconclusive → returns currentState, does not emit',
+        () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        var hits = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('down', 500);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 300),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // First tick confirms the outage (dCC=1).
+        expect(emissions, [ConnectionHealthState.internetDisconnected]);
+        final hitsBefore = hits;
+
+        // Now the plugin throws; checkNow's probe is inconclusive.
+        checker.throwOnCheck = _SimulatedNullError();
+        ConnectionHealthState? probed;
+        monitor.checkNow().then((s) => probed = s);
+        async.flushMicrotasks();
+        expect(hits, hitsBefore + 1, reason: 'checkNow ran a probe');
+        expect(
+          probed,
+          ConnectionHealthState.internetDisconnected,
+          reason: 'inconclusive checkNow returns last known currentState',
+        );
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'checkNow never emits',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8f: checkNow() must not silently wedge the poller when a non-Exception
+    // Error escapes the SERVER probe. In debug the guard's assert surfaces the
+    // programmer bug loudly (asserts are stripped in release, where it instead
+    // falls back to currentState and reschedules — that release path cannot be
+    // exercised with asserts enabled, and is covered by code review). The
+    // _loop-path guard is identical code; this test pins the shared guard.
+    // -------------------------------------------------------------------
+    test('8f: checkNow() surfaces an escaped Error via assert in debug', () {
+      fakeAsync((async) {
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            throw _SimulatedNullError();
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        Object? caught;
+        monitor.checkNow().catchError((Object e) {
+          caught = e;
+          return ConnectionHealthState.initial;
+        });
+        async.flushMicrotasks();
+        expect(
+          caught,
+          isA<AssertionError>(),
+          reason:
+              'a non-Exception Error escaping the server probe must surface '
+              'loudly in debug, not silently wedge checkNow',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8h: a thrown (null) tick reschedules on the RETRY cadence, not the
+    // relaxed healthy cadence — distinct intervals make the difference
+    // observable.
+    // -------------------------------------------------------------------
+    test('8h: a null (thrown) tick reschedules on the retry cadence', () {
+      fakeAsync((async) {
+        var hits = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('down', 500);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 300),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        expect(hits, 1);
+
+        // Every subsequent tick throws → null tick. If a null tick wrongly used
+        // the 300s healthy cadence, hits would stay at 1 across the next 21s.
+        checker.throwOnCheck = _SimulatedNullError();
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(hits, 2, reason: 'first null tick retried at ~10s, not ~300s');
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(hits, 3, reason: 'null ticks keep the retry cadence');
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
     // 9: stop() then start() → monitor resumes without throwing.
     // -------------------------------------------------------------------
     test('9: stop() then start() resumes without throwing', () {

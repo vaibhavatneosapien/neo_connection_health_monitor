@@ -4,6 +4,19 @@ All notable changes to `neo_connection_health` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2]
+
+Bug fix — the internet checker can throw a non-`Exception` `Error` (a null-deref inside `internet_connection_checker_plus` on some platforms). Previously that escaped the `on Exception` catches, rejected the poll loop's future, and wedged the poller — the last banner froze on screen until the app was backgrounded and resumed. A first fix made the throw resolve to `healthy`, which was worse: it emitted a false all-clear over a real outage and reset the confirmation gate.
+
+### Fixed
+- **A thrown internet check is now inconclusive, not `healthy`.** `_runCheck` returns `null` on a failure-path internet check that throws; `_loop` and `checkNow` skip the tick — no emit, no confirmation-gate reset, the last banner is preserved. A throw is neither proof of offline nor proof of health, so it moves state in neither direction, and the loop still reschedules so the poller cannot wedge (`lib/src/connection_health_monitor.dart`).
+- **Cold-start dead zone closed.** When the check is inconclusive at launch (no prior banner, `currentState == initial`) and the server probe already failed, the monitor leans to `internetDisconnected` (still routed through the confirmation gate) rather than showing nothing forever on a platform where the plugin throws every tick.
+- **Failure-path internet check is now bounded** by `requestTimeout` via `.timeout(...)`; previously it could hang unbounded.
+- **`checkNow()` no longer wedges the poller** if a non-`Exception` `Error` escapes the server probe: it now carries the same last-resort guard as `_loop` (assert in debug, fall back to the last known state and reschedule in release).
+
+### Changed
+- `checkNow()` returns the last known `currentState` on an inconclusive (thrown) check rather than a freshly observed value; dartdoc updated. `_loop`'s last-resort catch widened to `on Object` with an `assert(e is Exception)` so a genuine programmer `Error` stays loud in debug and is swallowed only in release.
+
 ## [0.4.1]
 
 Release housekeeping — **no functional change over 0.4.0**. `v0.4.0` was tagged on the pre-merge feature commit; `v0.4.1` sits on `master` HEAD with the pubspec version matching the tag. Pin `v0.4.1` going forward.
