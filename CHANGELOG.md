@@ -10,12 +10,14 @@ Bug fix — the internet checker can throw a non-`Exception` `Error` (a null-der
 
 ### Fixed
 - **A thrown internet check is now inconclusive, not `healthy`.** `_runCheck` returns `null` on a failure-path internet check that throws; `_loop` and `checkNow` skip the tick — no emit, no confirmation-gate reset, the last banner is preserved. A throw is neither proof of offline nor proof of health, so it moves state in neither direction, and the loop still reschedules so the poller cannot wedge (`lib/src/connection_health_monitor.dart`).
-- **Cold-start dead zone closed.** When the check is inconclusive at launch (no prior banner, `currentState == initial`) and the server probe already failed, the monitor leans to `internetDisconnected` (still routed through the confirmation gate) rather than showing nothing forever on a platform where the plugin throws every tick.
 - **Failure-path internet check is now bounded** by `requestTimeout` via `.timeout(...)`; previously it could hang unbounded.
 - **`checkNow()` no longer wedges the poller** if a non-`Exception` `Error` escapes the server probe: it now carries the same last-resort guard as `_loop` (assert in debug, fall back to the last known state and reschedule in release).
 
 ### Changed
 - `checkNow()` returns the last known `currentState` on an inconclusive (thrown) check rather than a freshly observed value; dartdoc updated. `_loop`'s last-resort catch widened to `on Object` with an `assert(e is Exception)` so a genuine programmer `Error` stays loud in debug and is swallowed only in release.
+
+### Known limits (accepted)
+- **Cold-start dead zone.** If the plugin throws on EVERY tick while the device is also offline, a monitor launched into that state stays at `initial` with no banner: an inconclusive check is deliberately never allowed to advance the confirmation gate (that invisibility is load-bearing — see test 8c), and we cannot prove offline without a working checker. Narrow and unproven in the field; documented in `_loop` rather than guessed at.
 
 ## [0.4.1]
 
