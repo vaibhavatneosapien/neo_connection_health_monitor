@@ -410,7 +410,9 @@ class ConnectionHealthMonitor {
     // _runCheck that completes after this checkNow would overwrite the
     // timer scheduled below, resetting the schedule from the wrong point.
     final gen = ++_generation;
-    final state = await _runCheck();
+    // `_runCheck` returns `null` on an inconclusive tick (internet check threw);
+    // report the last known state to the caller and use the retry cadence.
+    final state = await _runCheck() ?? _currentState;
     if (_disposed) return state;
     if (_running && gen == _generation) {
       _pendingTimer = Timer(_nextDelay(state), () {
@@ -433,12 +435,22 @@ class ConnectionHealthMonitor {
     ConnectionHealthState? state;
     try {
       state = await _runCheck();
-    } on Object {
+    } on Object catch (e, st) {
       // Last-resort guard. `_runCheck` is expected to swallow every probe
       // fault itself, but if anything ever escapes it, the poller must NOT
       // die: a rejected `_loop` future stops rescheduling, freezing the last
       // banner on screen until the app is backgrounded/resumed. Skip this
       // tick's emit and fall through to reschedule.
+      //
+      // But an `Error` (StateError, type error) escaping here is our own
+      // programmer bug, which the server-probe catch deliberately lets
+      // propagate ("Do NOT catch Error"). Re-surface it in debug via assert
+      // (stripped in release) so it is loud in development; in release keep
+      // swallowing so a production device never wedges on it.
+      assert(
+        e is Exception,
+        'Non-Exception escaped _runCheck (likely a programmer bug): $e\n$st',
+      );
       // ponytail: swallowed without logging (the package takes no logger yet);
       // route it to a log seam here if one is ever added.
     }
@@ -473,7 +485,12 @@ class ConnectionHealthMonitor {
   /// but block public CDN probe endpoints, and keeps the happy path (fast
   /// 2xx) at ONE request — the second probe runs only on the rare slow 2xx
   /// or the rare failure.
-  Future<ConnectionHealthState> _runCheck() async {
+  ///
+  /// Returns `null` when the failure-path internet check is INCONCLUSIVE (it
+  /// threw): the tick is skipped by the caller — no emit, no confirmation-gate
+  /// reset, last banner preserved. A throw is neither proof of offline nor
+  /// proof of health, so it must not move state in either direction.
+  Future<ConnectionHealthState?> _runCheck() async {
     var serverOk = false;
     // `clock.now()` rather than `Stopwatch`: `fake_async` installs a fake
     // `Clock` but leaves `Stopwatch` on the real wall clock, so a stopwatch
@@ -531,10 +548,14 @@ class ConnectionHealthMonitor {
       hasInternet = null;
     }
     // Only a CLEAN `false` (endpoints reached, none answered) is proof the
-    // device is offline. A throw is inconclusive — and blaming the user's link
-    // without proof is exactly the false "check your WiFi" banner we must
-    // avoid — so an inconclusive check resolves to `healthy`, the same "no
-    // proof, don't blame the link" stance as `_userInternetIsSlow`.
+    // device is offline. A throw is inconclusive: return `null` to SKIP this
+    // tick entirely — no emit, no confirmation-gate reset, last banner
+    // preserved. Returning `healthy` here instead would emit a false all-clear
+    // AND clear the gate, so a genuinely offline device whose plugin throws on
+    // alternating ticks would never confirm `internetDisconnected` (it never
+    // reaches a run of `downConfirmationCount`) and stay masked as healthy. The
+    // loop reschedules on `null` regardless, so a wedge is still impossible.
+    if (hasInternet == null) return null;
     if (hasInternet == false) return ConnectionHealthState.internetDisconnected;
     // serverUnreachable is now owned by the app's firebase `system_banners`
     // channel — see

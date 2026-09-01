@@ -421,14 +421,16 @@ void main() {
 
     // -------------------------------------------------------------------
     // 8b: the internet checker throws a non-Exception Error (a plugin
-    // null-deref). It must NOT escape and wedge the poller, and a throw is
-    // inconclusive — not proof of offline — so it must clear the banner
-    // rather than freeze it. Regression for the "banner stuck until the app
-    // is backgrounded/resumed" report.
+    // null-deref). It must NOT escape and wedge the poller. A throw is
+    // INCONCLUSIVE — neither proof of offline nor proof of health — so the
+    // tick is skipped: the last confirmed banner is PRESERVED (never frozen
+    // by a wedge, never cleared by a false all-clear). Regression for the
+    // "banner stuck until the app is backgrounded/resumed" report AND for the
+    // masking bug where a throw emitted a false `healthy` over a real outage.
     // -------------------------------------------------------------------
     test(
         '8b: internet checker throwing an Error does not wedge the poller '
-        'and does not show a false banner', () {
+        'and preserves the last banner (no false all-clear)', () {
       fakeAsync((async) {
         final emissions = <ConnectionHealthState>[];
         var hits = 0;
@@ -460,19 +462,65 @@ void main() {
         );
         expect(
           emissions,
-          [
-            ConnectionHealthState.internetDisconnected,
-            ConnectionHealthState.healthy,
-          ],
-          reason: 'a check that THREW is inconclusive, not proof of offline; '
-              'it must clear the banner, never freeze it',
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'a check that THREW is inconclusive; the tick is skipped and '
+              'the offline banner is preserved — NOT overwritten with a false '
+              'healthy',
         );
 
-        // And the poller is still alive on subsequent ticks.
+        // And the poller is still alive on subsequent ticks, banner intact.
         async.elapse(const Duration(seconds: 11));
         async.flushMicrotasks();
         expect(hits, 3, reason: 'poller still scheduling after the throw');
-        expect(monitor.currentState, ConnectionHealthState.healthy);
+        expect(
+            monitor.currentState, ConnectionHealthState.internetDisconnected);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8c: THE P1 REGRESSION. Genuinely offline device, downConfirmationCount=2
+    // (shipped production value), plugin throws on INTERLEAVED ticks. The old
+    // "throw → healthy" behavior emitted a false `healthy` AND reset the
+    // confirmation gate, so `internetDisconnected` never reached a run of 2 and
+    // the device stayed masked as healthy forever. With "throw → skip tick" the
+    // throws are invisible: the clean `false` ticks accumulate and confirm the
+    // real outage.
+    // -------------------------------------------------------------------
+    test('8c: offline + intermittent throw still confirms outage at dCC=2', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('down', 500)),
+          internetChecker: checker,
+          downConfirmationCount: 2,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 10),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // Tick 1: clean false → internetDisconnected, streak=1, not confirmed.
+        expect(emissions, isEmpty);
+
+        // Tick 2: plugin throws → skipped (no emit, gate untouched, streak
+        // stays 1). Under the old bug this emitted healthy and reset the gate.
+        checker.throwOnCheck = _SimulatedNullError();
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(emissions, isEmpty, reason: 'thrown tick is invisible');
+
+        // Tick 3: clean false again → streak reaches 2 → outage confirmed.
+        checker.throwOnCheck = null;
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'the real outage confirms; a throw must not reset the gate '
+              'or inject a false healthy that masks it',
+        );
         monitor.dispose();
       });
     });
@@ -1310,6 +1358,40 @@ void main() {
           emissions,
           [ConnectionHealthState.healthy],
           reason: 'backend 2xx + CDNs blocked cannot prove a slow link',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 28d: slow 2xx but the internet check THROWS (plugin null-deref on the
+    // slow path). A throw is not positive evidence of a slow link, so
+    // `_userInternetIsSlow` returns false and the state resolves to healthy —
+    // and the throw must not wedge the loop.
+    // -------------------------------------------------------------------
+    test('28d: slow 200 + internet check throws → healthy (not weakNetwork)',
+        () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final checker = _FakeInternetConnection(online: true)
+          ..throwOnCheck = _SimulatedNullError();
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            await Future<void>.delayed(const Duration(seconds: 4));
+            return http.Response('ok', 200);
+          }),
+          internetChecker: checker,
+          slowThreshold: const Duration(seconds: 3),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.healthy],
+          reason: 'a thrown internet check cannot prove a slow link',
         );
         monitor.dispose();
       });
