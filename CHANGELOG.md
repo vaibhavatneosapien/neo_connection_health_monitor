@@ -4,6 +4,25 @@ All notable changes to `neo_connection_health` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2]
+
+Bug fix — the internet checker can throw a non-`Exception` `Error` (a null-deref inside `internet_connection_checker_plus` on some platforms). Previously that escaped the `on Exception` catches, rejected the poll loop's future, and wedged the poller — the last banner froze on screen until the app was backgrounded and resumed. A first fix made the throw resolve to `healthy`, which was worse: it emitted a false all-clear over a real outage and reset the confirmation gate.
+
+### Fixed
+- **A thrown internet check is now inconclusive, not `healthy`.** `_runCheck` returns `null` on a failure-path internet check that throws; `_loop` and `checkNow` skip the tick — no emit, no confirmation-gate reset, the last banner is preserved. A throw is neither proof of offline nor proof of health, so it moves state in neither direction, and the loop still reschedules so the poller cannot wedge (`lib/src/connection_health_monitor.dart`).
+- **Failure-path internet check is now bounded** by `requestTimeout` via `.timeout(...)`; previously it could hang unbounded.
+- **`checkNow()` no longer wedges the poller** if a non-`Exception` `Error` escapes the server probe: it now carries the same last-resort guard as `_loop` (assert in debug, fall back to the last known state and reschedule in release).
+
+### Changed
+- `checkNow()` returns the last known `currentState` on an inconclusive (thrown) check rather than a freshly observed value; dartdoc updated. `_loop`'s last-resort catch widened to `on Object` with an `assert(e is Exception)` so a genuine programmer `Error` stays loud in debug and is swallowed only in release.
+
+### Known limits (accepted)
+- **Cold-start dead zone.** If the plugin throws on EVERY tick while the device is also offline, a monitor launched into that state stays at `initial` with no banner: an inconclusive check is deliberately never allowed to advance the confirmation gate (that invisibility is load-bearing — see test 8c), and we cannot prove offline without a working checker. Narrow and unproven in the field; documented in `_loop` rather than guessed at.
+- **Silent recovery in release has no telemetry.** The `on Object` guards in `_loop` and `checkNow` keep a swallowed `Error` from wedging the poller, but the `assert(e is Exception)` that surfaces a genuine programmer/plugin `Error` is stripped in release. So a plugin that throws every tick in a shipped build leaves the banner frozen at its last value with no log or crash report — the fix traded the old wedge-but-visible-to-Crashlytics behaviour for keep-running-but-silent. The package takes no logger by design (CLAUDE.md §Out of scope); the upgrade path is an optional `onProbeError` callback the consumer wires to Crashlytics, marked at the `ponytail:` comment in `_loop`. Requires a latent `Error`-throwing bug to manifest, so accepted for now rather than fixed.
+
+### Test coverage (known gaps, accepted)
+- The `_loop` last-resort `on Object` guard is exercised only indirectly; the direct Error-escape test (8f) drives the `checkNow` guard, not the scheduled-tick path. The release-mode fall-through of both guards (asserts stripped → swallow → reschedule) is not exercised, because `dart test` runs with asserts enabled. Both are proven by review; a `start()`-driven test mirroring 8f would close the first.
+
 ## [0.4.1]
 
 Release housekeeping — **no functional change over 0.4.0**. `v0.4.0` was tagged on the pre-merge feature commit; `v0.4.1` sits on `master` HEAD with the pubspec version matching the tag. Pin `v0.4.1` going forward.
