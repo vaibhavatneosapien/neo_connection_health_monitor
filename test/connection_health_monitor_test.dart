@@ -479,6 +479,45 @@ void main() {
     });
 
     // -------------------------------------------------------------------
+    // 8bt: Failure-path internet probe TIMES OUT (distinct from a throw). A
+    // hanging/black-holing link makes every neutral-CDN endpoint dribble past
+    // `requestTimeout`, so `.timeout(requestTimeout)` fires a
+    // `TimeoutException`. Unlike a plugin `Error` (inconclusive → skip), a
+    // timeout is positive offline evidence — the device could not reach the
+    // internet — so it MUST resolve to `internetDisconnected`, not preserve a
+    // stale banner. Regression for Ship-Wright PR #4 finding #1.
+    // -------------------------------------------------------------------
+    test(
+        '8bt: failure-path internet probe timeout → internetDisconnected '
+        '(not a skipped tick)', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        // responseDelay (20s) exceeds requestTimeout (8s): the internet probe
+        // hangs and the outer .timeout fires a TimeoutException.
+        final checker = _FakeInternetConnection(
+          online: true,
+          responseDelay: const Duration(seconds: 20),
+        );
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('down', 500)),
+          internetChecker: checker,
+          requestTimeout: const Duration(seconds: 8),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        // Let the server probe fail, then the internet probe hit its 8s timeout.
+        async.elapse(const Duration(seconds: 9));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'a hung internet probe is offline evidence, not inconclusive',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
     // 8c: THE P1 REGRESSION. Genuinely offline device, downConfirmationCount=2
     // (shipped production value), plugin throws on INTERLEAVED ticks. The old
     // "throw → healthy" behavior emitted a false `healthy` AND reset the

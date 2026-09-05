@@ -144,13 +144,21 @@ particular:
   a probe failure. `_loop`'s last-resort guard asserts `e is Exception` so our
   own `Error`s stay loud in debug and are swallowed only in release. Flipping
   either catch, or removing the assert, is a **P1**.
-- **Inconclusive internet check returns `null` → skip the tick.** A thrown
-  failure-path internet check is neither proof of offline nor proof of health:
-  `_runCheck` returns `null`, and `_loop`/`checkNow` skip the tick (no emit, no
-  confirmation-gate reset, last banner preserved). A change that makes a thrown
-  check emit `healthy` (or `internetDisconnected`) instead is a **P1** — it
-  either fakes an all-clear over a real outage or blames the user's link
-  without proof.
+- **Inconclusive internet check returns `null` → skip the tick — except a
+  timeout (sanctioned carve-out, 0.4.2).** A failure-path internet check that
+  throws a non-`Exception` `Error` (plugin null-deref) is neither proof of
+  offline nor proof of health: `_runCheck` returns `null`, and
+  `_loop`/`checkNow` skip the tick (no emit, no confirmation-gate reset, last
+  banner preserved). A change that makes such a thrown check emit `healthy` (or
+  `internetDisconnected`) instead is a **P1** — it either fakes an all-clear
+  over a real outage or blames the user's link without proof. **The one
+  sanctioned exception is a `TimeoutException`** from the tiebreaker probe: it
+  is read as offline (`internetDisconnected`) because the checker returns a
+  clean `false` as soon as it can prove the link is dead, so a full-timeout is
+  positive offline evidence, not an inconclusive `Error`. This carve-out is
+  cited in CLAUDE.md §4 and CHANGELOG 0.4.2 and pinned by test 8bt; the
+  `on TimeoutException` clause must stay ordered before `on Object`. Do not
+  re-flag it as a P1, and do not extend it to any other throw type.
 - **Confirmation gate — the `weakNetwork`/Rule-2 exemption is the most-repeated
   bug in this package (twice).** `weakNetwork` is a SUCCESS; it must not count
   as "degraded is on screen" for Rule 2 and must clear `_degradedRun` on

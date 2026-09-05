@@ -53,7 +53,18 @@ class ConnectionHealthMonitor {
   ///   probe-reachable failure since `serverUnreachable` was retired in
   ///   0.4.0). Default: 1 minute.
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
-  ///   (chosen over 5 s for 3G on tier-2 networks).
+  ///   (chosen over 5 s for 3G on tier-2 networks). It also bounds the
+  ///   failure-path internet tiebreaker: a probe that runs past it throws
+  ///   `TimeoutException` and is read as offline (`internetDisconnected`).
+  ///   For that to mean "the link is dead" rather than "the link is slow",
+  ///   `requestTimeout` MUST exceed the injected [internetChecker]'s own
+  ///   per-endpoint timeout. The default checker
+  ///   (`internet_connection_checker_plus`) probes its endpoints in parallel
+  ///   at 3 s each and returns a clean `false` when all fail, so the 8 s
+  ///   default clears it with headroom and the timeout branch fires only on a
+  ///   genuinely hung link. If you inject a checker whose per-endpoint timeout
+  ///   is >= `requestTimeout`, a slow-but-working link can be mislabelled
+  ///   `internetDisconnected` - raise `requestTimeout` above it.
   /// - [slowThreshold] - a probe that SUCCEEDS but takes longer than
   ///   this reports [ConnectionHealthState.weakNetwork] instead of
   ///   `healthy`. Default: 3 seconds. Must be `> Duration.zero` and
@@ -573,6 +584,22 @@ class ConnectionHealthMonitor {
     try {
       hasInternet =
           await _internetChecker.hasInternetAccess.timeout(requestTimeout);
+    } on TimeoutException {
+      // Every neutral CDN endpoint (Cloudflare/Apple/Google) hung past
+      // `requestTimeout`. Unlike a plugin `Error`, this is positive evidence
+      // the device cannot reach the internet — a hanging/black-holing link is
+      // offline from the user's point of view — so treat it as a clean
+      // `false`, not an inconclusive skip. Without this, a black-holing captive
+      // portal that makes the probe hang would leave the last banner frozen
+      // instead of showing `internetDisconnected`.
+      //
+      // ponytail: near-dead branch under the DEFAULT checker — the plugin caps
+      // each endpoint at 3 s and returns a clean `false` well before this 8 s
+      // outer timeout, so this fires only on a genuinely hung link, or once an
+      // injected checker's per-endpoint timeout meets/exceeds `requestTimeout`
+      // (the footgun the `requestTimeout` dartdoc warns about). Do not delete as
+      // "unreachable"; enforce the invariant in code if a custom checker ships.
+      hasInternet = false;
     } on Object {
       // `on Object`, not `on Exception`: the checker can throw a non-Exception
       // `Error` (a null-deref inside the plugin on some platforms). An `Error`
