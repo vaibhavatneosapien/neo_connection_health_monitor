@@ -592,6 +592,13 @@ class ConnectionHealthMonitor {
       // `false`, not an inconclusive skip. Without this, a black-holing captive
       // portal that makes the probe hang would leave the last banner frozen
       // instead of showing `internetDisconnected`.
+      //
+      // ponytail: near-dead branch under the DEFAULT checker — the plugin caps
+      // each endpoint at 3 s and returns a clean `false` well before this 8 s
+      // outer timeout, so this fires only on a genuinely hung link, or once an
+      // injected checker's per-endpoint timeout meets/exceeds `requestTimeout`
+      // (the footgun the `requestTimeout` dartdoc warns about). Do not delete as
+      // "unreachable"; enforce the invariant in code if a custom checker ships.
       hasInternet = false;
     } on Object {
       // `on Object`, not `on Exception`: the checker can throw a non-Exception
