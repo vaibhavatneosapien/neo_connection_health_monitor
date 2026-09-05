@@ -185,9 +185,10 @@ loop():
 
 Inject the `Random` so jitter is deterministic in tests (seeded `Random(42)` produces reproducible delays). Default to `Random()` in production. Test case #14 verifies 100 scheduled delays fall within ±10% of base interval.
 
-**Run flags.** Maintain two booleans on the instance:
+**Run flags.** Maintain two booleans plus a generation counter on the instance:
 - `_running` — true between `start()` and `stop()`. Loop checks this before scheduling the next iteration and before emitting; if false, bail without doing either.
 - `_disposed` — true after `dispose()`. Every public method must check this first and throw `StateError('ConnectionHealthMonitor has been disposed')` if true.
+- `_generation` — an int bumped on each `start()`/`checkNow()`. The recursive loop captures its `gen` and, after every `await`, bails if `gen != _generation` — so a check that completes after a `stop()`→`start()` cycle or a `checkNow()` cannot emit or reschedule against the superseded cycle. The loop must re-check all three (`_running`, `_disposed`, `_generation`) after each `await`.
 
 `start()` is idempotent — if already `_running`, return without scheduling a second loop. Two concurrent loops would emit duplicate events and double the request rate.
 
@@ -207,8 +208,22 @@ _runCheck():
   // NOTE: the v3 `_plus` API is `hasInternetAccess` (a Future<bool>
   // getter), NOT `hasConnection` — the latter is the ORIGINAL package's
   // API, which this package deliberately does not use.
-  if (!await internetChecker.hasInternetAccess) return internetDisconnected
-  return serverUnreachable
+  // The check is bounded (.timeout(requestTimeout)) and caught `on Object`,
+  // because the plugin can throw a non-Exception Error on some platforms.
+  //   - clean false  → internetDisconnected
+  //   - clean true   → healthy   (serverUnreachable retired in 0.4.0 — the
+  //                    producing `return` below is kept commented)
+  //   - THREW        → null = INCONCLUSIVE: skip the tick. The loop does not
+  //                    emit, does not touch the confirmation gate, preserves
+  //                    the last banner, and still reschedules. A throw is
+  //                    neither proof of offline nor of health, so it must move
+  //                    state in neither direction. See §Tech and CHANGELOG 0.4.2.
+  hasInternet = try { await internetChecker.hasInternetAccess.timeout(...) }
+                on Object { null }
+  if (hasInternet == null)  return null   // inconclusive → caller skips tick
+  if (hasInternet == false) return internetDisconnected
+  // return serverUnreachable   // retired 0.4.0; kept commented (Approach C)
+  return healthy
 ```
 
 **Why server-first (NOT internet-check-first).** `internet_connection_checker_plus` probes public CDN endpoints (`one.one.one.one` / Cloudflare, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com` / Google). On corporate firewalls, educational networks, and many Indian tier-2 ISP / corporate networks (which are part of Neosapien's user base), those probe endpoints are blocked while the Neosapien API host is whitelisted. The previous "internet-check-first" order would produce a false `internetDisconnected` verdict, and the UI would tell the user to "check your WiFi" — wrong message, wrong action, and the user cannot do anything to fix it because the WiFi is fine.
@@ -223,6 +238,8 @@ Rules:
 - Do not retry inside `_runCheck()` — the loop already retries on the 1-minute cadence. Retrying here doubles request rate without improving outcomes.
 - Read and discard the response body to free the connection back to the pool. Do not parse the body in v1 (future `serverDegraded` state will).
 
+**Failure-path internet check: timeout is offline, a raw `Error` is inconclusive (sanctioned 0.4.2).** When the server probe fails and the tiebreaker internet check is run, its outcomes are split deliberately: a clean `false` → `internetDisconnected`; a `true` → `healthy`; a non-`Exception` `Error` (plugin null-deref) → `null` → skip the tick (inconclusive — see the REVIEW.md "thrown check → skip" invariant); and a **`TimeoutException` → treated as offline (`internetDisconnected`)**. The last is a **sanctioned carve-out** to that invariant, not a violation: the checker probes neutral CDNs in parallel and returns a clean `false` as soon as it can prove the link is dead, so a probe that instead runs to `requestTimeout` is positive evidence of a hung/black-holing link, whereas a raw `Error` proves nothing. The `on TimeoutException` clause MUST stay ordered before `on Object` so only a genuine timeout takes the offline path. This holds only while `requestTimeout` exceeds the injected checker's per-endpoint timeout (default plugin: 3 s, well under the 8 s default) — otherwise a slow-but-working link times out and is mislabelled offline; the `requestTimeout` dartdoc records the invariant. Pinned by test 8bt.
+
 **Known limits of the dual-tier check.** The two-request disambiguation is right for the common cases (§4 rationale above), but it has two blind spots by construction. Both are accepted for v1 and documented here so they are not rediscovered as "bugs" during an incident:
 
 1. **False `serverUnreachable` on a whitelisting network (mirror of the case §4 fixes).** §4 inverted the check order to fix the false `internetDisconnected` that a CDN-blocking network produces. The mirror is not covered: a network that *permits* the internet-probe endpoints (`one.one.one.one`, `captive.apple.com`, `icanhazip.com`, `ajax.googleapis.com` — Google/Apple/Cloudflare hosts, among the most commonly whitelisted on earth) but *blocks our host* makes the server probe fail while `hasInternetAccess` reports `true` → `serverUnreachable`. The banner then says "Server down" when our backend is healthy and the real fault is a firewall between this device and us. Same shape reaches the user from **our own misconfiguration**: a wrong `healthPath` returns `404` (or `HEAD` returns `405`, §Tech), and a `404` is currently indistinguishable from a real outage — both are non-2xx → `serverUnreachable`. Test case #13b pins this.
@@ -231,7 +248,7 @@ Rules:
 
 2. **False `healthy` via TLS interception (iOS-MDM-only).** The happy path trusts any `2xx` as `healthy` without reading the body — the deliberate §Tech `GET`-not-`HEAD`/no-body-parse decision. Over HTTPS a captive portal *cannot* forge a `2xx`: without a device-trusted certificate for our host, interception surfaces as `HandshakeException`/`SocketException`/timeout (→ correctly `serverUnreachable`/`internetDisconnected`, not a fake `healthy`). The one exception is a **trusted MITM root already installed on the device**: an MDM-managed corporate proxy ("SSL inspection" — Zscaler, Palo Alto, etc.). On Android API 24+ apps ignore user/MDM-added CAs by default, so this fails closed there; on **iOS, MDM-installed roots are auto-trusted**, so a managed iOS device behind an SSL-inspecting proxy could receive a proxy-generated `2xx` (a block/login page) and read it as `healthy`. Narrow (managed iOS only), no proven mobile-app prevalence figure exists, and body-validation is not the fix (`/healthz` returns a static literal body — §Project — so there is nothing distinctive to validate, and zero of 12 surveyed industry health checkers default to body matching). Accepted for v1; recorded so a future `serverDegraded`/body-parse revision weighs it deliberately rather than inheriting it silently.
 
-3. **~~The slow path does NOT cross-check, so `weakNetwork` can mislabel a slow backend as a slow network.~~ RESOLVED (0.3.0).** The slow path now cross-checks. On a slow `2xx`, `_runCheck` no longer trusts the backend round trip alone — it times the user's real internet (the neutral-CDN probe via `_userInternetIsSlow`, `connection_health_monitor.dart`) and reports `weakNetwork` only on **positive evidence** the user's link is slow; a fast, blocked, unreachable, or errored internet check resolves to `healthy`. So a slow *backend* on a healthy link is now `healthy`, not a false "Weak Network". This matches the state's own definition (CONCEPTS.md: "your link slow, the server is fine") and needed no new enum value — the fix is a second probe on the rare slow-2xx path, and the happy path (fast 2xx) is still one request. See the plan doc `docs/plans/2026-07-30-001-feat-weak-internet-two-signal-plan.md`. NOTE the asymmetry that was NEVER a gap: `weakNetwork` is confirmed by the SAME gate as failures (`_isConfirmed`), and is in fact *stricter* — exempt from Rule 2's generic-failure shortcut (`:590-593`), so it can only confirm via a same-state run.
+3. **~~The slow path does NOT cross-check, so `weakNetwork` can mislabel a slow backend as a slow network.~~ RESOLVED (0.3.0).** The slow path now cross-checks. On a slow `2xx`, `_runCheck` no longer trusts the backend round trip alone — it times the user's real internet (the neutral-CDN probe via `_userInternetIsSlow`, `connection_health_monitor.dart`) and reports `weakNetwork` only on **positive evidence** the user's link is slow; a fast, blocked, unreachable, or errored internet check resolves to `healthy`. So a slow *backend* on a healthy link is now `healthy`, not a false "Weak Network". This matches the state's own definition (CONCEPTS.md: "your link slow, the server is fine") and needed no new enum value — the fix is a second probe on the rare slow-2xx path, and the happy path (fast 2xx) is still one request. See the plan doc `docs/plans/2026-07-30-001-feat-weak-internet-two-signal-plan.md`. NOTE the asymmetry, precisely: `weakNetwork` is confirmed by the SAME gate as failures (`_isConfirmed`) and CAN confirm via Rule 2's generic-failure shortcut (test 43 pins this: `internetDisconnected` → slow 200 confirms `weakNetwork` on the second observation, not the same-state run of Rule 1). Its two real exemptions are narrower: (1) it never counts as an on-screen banner for Rule 2's "reportingDegraded" check, so escalating OUT of `weakNetwork` into a real failure stays generically available; (2) it clears `_degradedRun` on observation (not merely on confirmation), so it never contributes to a future failure run. Adding a `state != weakNetwork` guard to Rule 2 itself would break test 43 — do not do it.
 
 ### 5. Stream behavior
 

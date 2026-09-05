@@ -27,6 +27,11 @@ class _FakeInternetConnection extends InternetConnection {
 
   bool online;
 
+  /// When non-null, [hasInternetAccess] throws this instead of returning.
+  /// Used to reproduce the plugin throwing a non-`Exception` `Error` (a
+  /// null-deref on some platforms) — which `on Exception` would let escape.
+  Object? throwOnCheck;
+
   /// Simulated latency of the neutral-CDN reachability check. `weakNetwork`
   /// now requires the USER's internet to be measurably slow (not merely the
   /// backend), so a test that wants `weakNetwork` sets this above the
@@ -44,6 +49,7 @@ class _FakeInternetConnection extends InternetConnection {
     if (responseDelay > Duration.zero) {
       await Future<void>.delayed(responseDelay);
     }
+    if (throwOnCheck != null) throw throwOnCheck!;
     return online;
   }
 
@@ -54,6 +60,11 @@ class _FakeInternetConnection extends InternetConnection {
     // this fake never started.
   }
 }
+
+/// An `Error` — NOT an `Exception`. Mirrors the null-deref the internet
+/// checker plugin can throw on some platforms; an `on Exception` clause would
+/// fail to catch it, so it is the exact shape that used to wedge the poller.
+class _SimulatedNullError extends Error {}
 
 /// Builds a `ConnectionHealthMonitor` with all dependencies injected. All
 /// timers are deterministic when run inside `fakeAsync(...)`.
@@ -403,6 +414,334 @@ void main() {
           emissions,
           [ConnectionHealthState.healthy],
           reason: 'server probe succeeded — internet probe is irrelevant',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8b: the internet checker throws a non-Exception Error (a plugin
+    // null-deref). It must NOT escape and wedge the poller. A throw is
+    // INCONCLUSIVE — neither proof of offline nor proof of health — so the
+    // tick is skipped: the last confirmed banner is PRESERVED (never frozen
+    // by a wedge, never cleared by a false all-clear). Regression for the
+    // "banner stuck until the app is backgrounded/resumed" report AND for the
+    // masking bug where a throw emitted a false `healthy` over a real outage.
+    // -------------------------------------------------------------------
+    test(
+        '8b: internet checker throwing an Error does not wedge the poller '
+        'and preserves the last banner (no false all-clear)', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        var hits = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('down', 500);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 10),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // Genuinely offline first: server 500 + clean `false` → banner shows.
+        expect(emissions, [ConnectionHealthState.internetDisconnected]);
+        expect(hits, 1);
+
+        // Now the plugin starts throwing a non-Exception Error on every check.
+        checker.throwOnCheck = _SimulatedNullError();
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          hits,
+          2,
+          reason: 'the throw must not wedge the loop — it keeps polling',
+        );
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'a check that THREW is inconclusive; the tick is skipped and '
+              'the offline banner is preserved — NOT overwritten with a false '
+              'healthy',
+        );
+
+        // And the poller is still alive on subsequent ticks, banner intact.
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(hits, 3, reason: 'poller still scheduling after the throw');
+        expect(
+            monitor.currentState, ConnectionHealthState.internetDisconnected);
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8bt: Failure-path internet probe TIMES OUT (distinct from a throw). A
+    // hanging/black-holing link makes every neutral-CDN endpoint dribble past
+    // `requestTimeout`, so `.timeout(requestTimeout)` fires a
+    // `TimeoutException`. Unlike a plugin `Error` (inconclusive → skip), a
+    // timeout is positive offline evidence — the device could not reach the
+    // internet — so it MUST resolve to `internetDisconnected`, not preserve a
+    // stale banner. Regression for Ship-Wright PR #4 finding #1.
+    // -------------------------------------------------------------------
+    test(
+        '8bt: failure-path internet probe timeout → internetDisconnected '
+        '(not a skipped tick)', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        // responseDelay (20s) exceeds requestTimeout (8s): the internet probe
+        // hangs and the outer .timeout fires a TimeoutException.
+        final checker = _FakeInternetConnection(
+          online: true,
+          responseDelay: const Duration(seconds: 20),
+        );
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('down', 500)),
+          internetChecker: checker,
+          requestTimeout: const Duration(seconds: 8),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        // Let the server probe fail, then the internet probe hit its 8s timeout.
+        async.elapse(const Duration(seconds: 9));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'a hung internet probe is offline evidence, not inconclusive',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8c: THE P1 REGRESSION. Genuinely offline device, downConfirmationCount=2
+    // (shipped production value), plugin throws on INTERLEAVED ticks. The old
+    // "throw → healthy" behavior emitted a false `healthy` AND reset the
+    // confirmation gate, so `internetDisconnected` never reached a run of 2 and
+    // the device stayed masked as healthy forever. With "throw → skip tick" the
+    // throws are invisible: the clean `false` ticks accumulate and confirm the
+    // real outage.
+    // -------------------------------------------------------------------
+    test('8c: offline + intermittent throw still confirms outage at dCC=2', () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async => http.Response('down', 500)),
+          internetChecker: checker,
+          downConfirmationCount: 2,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 10),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // Tick 1: clean false → internetDisconnected, streak=1, not confirmed.
+        expect(emissions, isEmpty);
+
+        // Tick 2: plugin throws → skipped (no emit, gate untouched, streak
+        // stays 1). Under the old bug this emitted healthy and reset the gate.
+        checker.throwOnCheck = _SimulatedNullError();
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(emissions, isEmpty, reason: 'thrown tick is invisible');
+
+        // Tick 3: clean false again → streak reaches 2 → outage confirmed.
+        checker.throwOnCheck = null;
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'the real outage confirms; a throw must not reset the gate '
+              'or inject a false healthy that masks it',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8e: checkNow() on an inconclusive tick (internet check throws) returns
+    // the last known currentState, does NOT emit, and reschedules on the retry
+    // cadence — the `_runCheck() ?? _currentState` fallback.
+    // -------------------------------------------------------------------
+    test('8e: checkNow() inconclusive → returns currentState, does not emit',
+        () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        var hits = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('down', 500);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 300),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+        async.flushMicrotasks();
+        // First tick confirms the outage (dCC=1).
+        expect(emissions, [ConnectionHealthState.internetDisconnected]);
+        final hitsBefore = hits;
+
+        // Now the plugin throws; checkNow's probe is inconclusive.
+        checker.throwOnCheck = _SimulatedNullError();
+        ConnectionHealthState? probed;
+        monitor.checkNow().then((s) => probed = s);
+        async.flushMicrotasks();
+        expect(hits, hitsBefore + 1, reason: 'checkNow ran a probe');
+        expect(
+          probed,
+          ConnectionHealthState.internetDisconnected,
+          reason: 'inconclusive checkNow returns last known currentState',
+        );
+        expect(
+          emissions,
+          [ConnectionHealthState.internetDisconnected],
+          reason: 'checkNow never emits',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8f: checkNow() must not silently wedge the poller when a non-Exception
+    // Error escapes the SERVER probe. In debug the guard's assert surfaces the
+    // programmer bug loudly (asserts are stripped in release, where it instead
+    // falls back to currentState and reschedules — that release path cannot be
+    // exercised with asserts enabled, and is covered by code review). The
+    // _loop-path guard is identical code; this test pins the shared guard.
+    // -------------------------------------------------------------------
+    test('8f: checkNow() surfaces an escaped Error via assert in debug', () {
+      fakeAsync((async) {
+        var serverThrows = true;
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            if (serverThrows) throw _SimulatedNullError();
+            return http.Response('ok', 200);
+          }),
+          internetChecker: _FakeInternetConnection(online: true),
+        );
+        Object? caught;
+        monitor.checkNow().catchError((Object e) {
+          caught = e;
+          return ConnectionHealthState.initial;
+        });
+        async.flushMicrotasks();
+        expect(
+          caught,
+          isA<AssertionError>(),
+          reason:
+              'a non-Exception Error escaping the server probe must surface '
+              'loudly in debug, not silently wedge checkNow',
+        );
+
+        // Not permanently wedged: with the fault cleared, start() resumes the
+        // poller normally rather than throwing or staying frozen.
+        serverThrows = false;
+        expect(() => monitor.start(), returnsNormally);
+        async.flushMicrotasks();
+        expect(monitor.currentState, ConnectionHealthState.healthy);
+
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8h: a thrown (null) tick reschedules on the RETRY cadence, not the
+    // relaxed healthy cadence — distinct intervals make the difference
+    // observable.
+    // -------------------------------------------------------------------
+    test('8h: a null (thrown) tick reschedules on the retry cadence', () {
+      fakeAsync((async) {
+        var hits = 0;
+        final checker = _FakeInternetConnection(online: false);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('down', 500);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 300),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        expect(hits, 1);
+
+        // Every subsequent tick throws → null tick. If a null tick wrongly used
+        // the 300s healthy cadence, hits would stay at 1 across the next 21s.
+        checker.throwOnCheck = _SimulatedNullError();
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(hits, 2, reason: 'first null tick retried at ~10s, not ~300s');
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(hits, 3, reason: 'null ticks keep the retry cadence');
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 8i: checkNow() with an INCONCLUSIVE probe (internet check throws)
+    // while currentState is healthy must reschedule on the RETRY cadence,
+    // not the (relaxed) healthy cadence — cadence parity between checkNow's
+    // reschedule and `_loop`'s. Distinct intervals make the difference
+    // observable.
+    // -------------------------------------------------------------------
+    test(
+        '8i: checkNow() inconclusive while healthy reschedules on retry '
+        'cadence, not healthy cadence', () {
+      fakeAsync((async) {
+        var hits = 0;
+        var statusCode = 200;
+        final checker = _FakeInternetConnection(online: true);
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            hits++;
+            return http.Response('', statusCode);
+          }),
+          internetChecker: checker,
+          retryInterval: const Duration(seconds: 10),
+          healthyInterval: const Duration(seconds: 300),
+        );
+        monitor.start();
+        async.flushMicrotasks();
+        expect(monitor.currentState, ConnectionHealthState.healthy);
+        final hitsAfterStart = hits;
+
+        // Server now fails AND the internet check is inconclusive (throws):
+        // checkNow's probe is null, so it falls back to the last known
+        // currentState (healthy) — but must schedule the NEXT probe at the
+        // retry cadence, not the healthy one.
+        statusCode = 500;
+        checker.throwOnCheck = _SimulatedNullError();
+        ConnectionHealthState? probed;
+        monitor.checkNow().then((s) => probed = s);
+        async.flushMicrotasks();
+        expect(hits, hitsAfterStart + 1, reason: 'checkNow ran a probe');
+        expect(
+          probed,
+          ConnectionHealthState.healthy,
+          reason: 'inconclusive checkNow returns last known currentState',
+        );
+
+        // If the reschedule wrongly used the healthy (300s) cadence, this
+        // 11s elapse would not trigger another probe.
+        async.elapse(const Duration(seconds: 11));
+        async.flushMicrotasks();
+        expect(
+          hits,
+          hitsAfterStart + 2,
+          reason: 'inconclusive checkNow must reschedule at the RETRY '
+              'cadence (~10s), not the healthy cadence (~300s)',
         );
         monitor.dispose();
       });
@@ -1241,6 +1580,40 @@ void main() {
           emissions,
           [ConnectionHealthState.healthy],
           reason: 'backend 2xx + CDNs blocked cannot prove a slow link',
+        );
+        monitor.dispose();
+      });
+    });
+
+    // -------------------------------------------------------------------
+    // 28d: slow 2xx but the internet check THROWS (plugin null-deref on the
+    // slow path). A throw is not positive evidence of a slow link, so
+    // `_userInternetIsSlow` returns false and the state resolves to healthy —
+    // and the throw must not wedge the loop.
+    // -------------------------------------------------------------------
+    test('28d: slow 200 + internet check throws → healthy (not weakNetwork)',
+        () {
+      fakeAsync((async) {
+        final emissions = <ConnectionHealthState>[];
+        final checker = _FakeInternetConnection(online: true)
+          ..throwOnCheck = _SimulatedNullError();
+        final monitor = _build(
+          httpClient: MockClient((_) async {
+            await Future<void>.delayed(const Duration(seconds: 4));
+            return http.Response('ok', 200);
+          }),
+          internetChecker: checker,
+          slowThreshold: const Duration(seconds: 3),
+        );
+        monitor.stream.listen(emissions.add);
+        monitor.start();
+
+        async.elapse(const Duration(seconds: 5));
+        async.flushMicrotasks();
+        expect(
+          emissions,
+          [ConnectionHealthState.healthy],
+          reason: 'a thrown internet check cannot prove a slow link',
         );
         monitor.dispose();
       });

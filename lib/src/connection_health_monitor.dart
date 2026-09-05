@@ -53,7 +53,18 @@ class ConnectionHealthMonitor {
   ///   probe-reachable failure since `serverUnreachable` was retired in
   ///   0.4.0). Default: 1 minute.
   /// - [requestTimeout] - per-request timeout. Default: 8 seconds
-  ///   (chosen over 5 s for 3G on tier-2 networks).
+  ///   (chosen over 5 s for 3G on tier-2 networks). It also bounds the
+  ///   failure-path internet tiebreaker: a probe that runs past it throws
+  ///   `TimeoutException` and is read as offline (`internetDisconnected`).
+  ///   For that to mean "the link is dead" rather than "the link is slow",
+  ///   `requestTimeout` MUST exceed the injected [internetChecker]'s own
+  ///   per-endpoint timeout. The default checker
+  ///   (`internet_connection_checker_plus`) probes its endpoints in parallel
+  ///   at 3 s each and returns a clean `false` when all fail, so the 8 s
+  ///   default clears it with headroom and the timeout branch fires only on a
+  ///   genuinely hung link. If you inject a checker whose per-endpoint timeout
+  ///   is >= `requestTimeout`, a slow-but-working link can be mislabelled
+  ///   `internetDisconnected` - raise `requestTimeout` above it.
   /// - [slowThreshold] - a probe that SUCCEEDS but takes longer than
   ///   this reports [ConnectionHealthState.weakNetwork] instead of
   ///   `healthy`. Default: 3 seconds. Must be `> Duration.zero` and
@@ -383,6 +394,11 @@ class ConnectionHealthMonitor {
   /// Performs a one-off health check immediately and returns the
   /// observed state.
   ///
+  /// When the check is inconclusive — the internet probe threw, so there is no
+  /// proof either way — this returns the last known [currentState] rather than
+  /// a freshly observed value (there is nothing new to report). So "returns the
+  /// observed state" holds except on that inconclusive path.
+  ///
   /// Pure probe: the returned [Future] is the ONLY delivery path. It does
   /// not emit on [stream] and does not move [currentState] — both continue
   /// to report the last state the polling loop confirmed. Use it from a
@@ -410,12 +426,36 @@ class ConnectionHealthMonitor {
     // _runCheck that completes after this checkNow would overwrite the
     // timer scheduled below, resetting the schedule from the wrong point.
     final gen = ++_generation;
-    final state = await _runCheck();
+    // `_runCheck` returns `null` when the internet check was inconclusive (it
+    // threw); the `on Object` guard additionally catches a non-Exception
+    // `Error` escaping the server probe (which `_runCheck` deliberately does
+    // NOT catch). In both cases the probe told us nothing new, so we report the
+    // last known state to the caller and — like `_loop` — reschedule on the
+    // RETRY cadence (something is wrong, re-probe soon), not the relaxed one.
+    //
+    // The guard prevents a RELEASE wedge: without it an escaped `Error` would
+    // reject this future after `_pendingTimer` was already cancelled above,
+    // stopping the poller until the caller does stop()/start(). In DEBUG the
+    // assert deliberately still fails loud (like `_loop`) so a real programmer
+    // bug is not swallowed — asserts are stripped in release, where the
+    // fall-through reschedule runs.
+    ConnectionHealthState? probed;
+    try {
+      probed = await _runCheck();
+    } on Object catch (e, st) {
+      assert(
+        e is Exception,
+        'Non-Exception escaped _runCheck (likely a programmer bug): $e\n$st',
+      );
+      probed = null;
+    }
+    final state = probed ?? _currentState;
     if (_disposed) return state;
     if (_running && gen == _generation) {
-      _pendingTimer = Timer(_nextDelay(state), () {
-        unawaited(_loop(gen));
-      });
+      _pendingTimer = Timer(
+        _nextDelay(probed ?? ConnectionHealthState.internetDisconnected),
+        () => unawaited(_loop(gen)),
+      );
     }
     return state;
   }
@@ -430,12 +470,45 @@ class ConnectionHealthMonitor {
   /// (see [_generation]).
   Future<void> _loop(int gen) async {
     if (!_running || _disposed || gen != _generation) return;
-    final state = await _runCheck();
+    ConnectionHealthState? state;
+    try {
+      state = await _runCheck();
+    } on Object catch (e, st) {
+      // Last-resort guard. `_runCheck` is expected to swallow every probe
+      // fault itself, but if anything ever escapes it, the poller must NOT
+      // die: a rejected `_loop` future stops rescheduling, freezing the last
+      // banner on screen until the app is backgrounded/resumed. Skip this
+      // tick's emit and fall through to reschedule.
+      //
+      // But an `Error` (StateError, type error) escaping here is our own
+      // programmer bug, which the server-probe catch deliberately lets
+      // propagate ("Do NOT catch Error"). Re-surface it in debug via assert
+      // (stripped in release) so it is loud in development; in release keep
+      // swallowing so a production device never wedges on it.
+      assert(
+        e is Exception,
+        'Non-Exception escaped _runCheck (likely a programmer bug): $e\n$st',
+      );
+      // ponytail: swallowed without logging (the package takes no logger yet);
+      // route it to a log seam here if one is ever added.
+    }
     if (!_running || _disposed || gen != _generation) return;
-    _emitIfChanged(state);
-    _pendingTimer = Timer(_nextDelay(state), () {
-      unawaited(_loop(gen));
-    });
+    if (state != null) _emitIfChanged(state);
+    // Accepted limitation (cold-start dead zone): a null tick is inconclusive,
+    // so it is skipped to keep a throw INVISIBLE — it must never advance the
+    // confirmation gate (that invisibility is load-bearing; see test 8c). The
+    // cost is that a device launched on a platform where the plugin throws on
+    // EVERY tick, while also offline, stays at `initial` with no banner: we
+    // cannot prove offline without a working checker, and guessing here would
+    // both blame the user's link without proof and let a throw drive
+    // confirmation. Narrow and unproven in the field; revisit only with data.
+    //
+    // On a thrown tick (state == null) retry soon rather than at the relaxed
+    // cadence — something is wrong and the next probe should confirm quickly.
+    _pendingTimer = Timer(
+      _nextDelay(state ?? ConnectionHealthState.internetDisconnected),
+      () => unawaited(_loop(gen)),
+    );
   }
 
   /// Server-first dual-tier check. On a fast 2xx from the server probe,
@@ -459,7 +532,12 @@ class ConnectionHealthMonitor {
   /// but block public CDN probe endpoints, and keeps the happy path (fast
   /// 2xx) at ONE request — the second probe runs only on the rare slow 2xx
   /// or the rare failure.
-  Future<ConnectionHealthState> _runCheck() async {
+  ///
+  /// Returns `null` when the failure-path internet check is INCONCLUSIVE (it
+  /// threw): the tick is skipped by the caller — no emit, no confirmation-gate
+  /// reset, last banner preserved. A throw is neither proof of offline nor
+  /// proof of health, so it must not move state in either direction.
+  Future<ConnectionHealthState?> _runCheck() async {
     var serverOk = false;
     // `clock.now()` rather than `Stopwatch`: `fake_async` installs a fake
     // `Clock` but leaves `Stopwatch` on the real wall clock, so a stopwatch
@@ -500,13 +578,48 @@ class ConnectionHealthMonitor {
     }
 
     // Server failed. Disambiguate via the generic internet probe.
-    bool hasInternet;
+    // `null` = the check could not be completed (threw), which is NOT the same
+    // as a clean `false`.
+    bool? hasInternet;
     try {
-      hasInternet = await _internetChecker.hasInternetAccess;
-    } on Exception {
+      hasInternet =
+          await _internetChecker.hasInternetAccess.timeout(requestTimeout);
+    } on TimeoutException {
+      // Every neutral CDN endpoint (Cloudflare/Apple/Google) hung past
+      // `requestTimeout`. Unlike a plugin `Error`, this is positive evidence
+      // the device cannot reach the internet — a hanging/black-holing link is
+      // offline from the user's point of view — so treat it as a clean
+      // `false`, not an inconclusive skip. Without this, a black-holing captive
+      // portal that makes the probe hang would leave the last banner frozen
+      // instead of showing `internetDisconnected`.
+      //
+      // ponytail: near-dead branch under the DEFAULT checker — the plugin caps
+      // each endpoint at 3 s and returns a clean `false` well before this 8 s
+      // outer timeout, so this fires only on a genuinely hung link, or once an
+      // injected checker's per-endpoint timeout meets/exceeds `requestTimeout`
+      // (the footgun the `requestTimeout` dartdoc warns about). Do not delete as
+      // "unreachable"; enforce the invariant in code if a custom checker ships.
       hasInternet = false;
+    } on Object {
+      // `on Object`, not `on Exception`: the checker can throw a non-Exception
+      // `Error` (a null-deref inside the plugin on some platforms). An `Error`
+      // is not an `Exception`, so an `on Exception` clause would let it escape,
+      // rejecting the `_loop` future — which then never reschedules. The poller
+      // wedges and the last banner freezes on screen until the app is
+      // backgrounded/resumed. Swallow everything here so the check stays
+      // self-contained; `hasInternet` stays `null` = "could not determine".
+      hasInternet = null;
     }
-    if (!hasInternet) return ConnectionHealthState.internetDisconnected;
+    // Only a CLEAN `false` (endpoints reached, none answered) is proof the
+    // device is offline. A throw is inconclusive: return `null` to SKIP this
+    // tick entirely — no emit, no confirmation-gate reset, last banner
+    // preserved. Returning `healthy` here instead would emit a false all-clear
+    // AND clear the gate, so a genuinely offline device whose plugin throws on
+    // alternating ticks would never confirm `internetDisconnected` (it never
+    // reaches a run of `downConfirmationCount`) and stay masked as healthy. The
+    // loop reschedules on `null` regardless, so a wedge is still impossible.
+    if (hasInternet == null) return null;
+    if (hasInternet == false) return ConnectionHealthState.internetDisconnected;
     // serverUnreachable is now owned by the app's firebase `system_banners`
     // channel — see
     // docs/plans/2026-07-31-001-refactor-decouple-server-unreachable-firebase-plan.md.
@@ -537,7 +650,10 @@ class ConnectionHealthMonitor {
       final reachable =
           await _internetChecker.hasInternetAccess.timeout(requestTimeout);
       if (!reachable) return false;
-    } on Exception {
+    } on Object {
+      // `on Object`, not `on Exception`: the checker can throw a non-Exception
+      // `Error` (null-deref inside the plugin on some platforms), which must
+      // not escape and wedge the poller. Inconclusive = not proven slow.
       return false;
     }
     return clock.now().difference(startedAt) > slowThreshold;
